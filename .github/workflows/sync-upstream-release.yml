@@ -139,6 +139,13 @@ jobs:
           package_json_file: upstream/package.json
           dest: ${{ runner.temp }}/setup-pnpm
 
+      - name: Fetch optional natives for every published OS
+        run: |
+          set -euo pipefail
+          # Publisher checkout, not upstream/scripts: official build:official
+          # typechecks scripts/*.ts and this overlay keeps @deepseek-ai/ as data.
+          node --experimental-strip-types scripts/bundle-cli.ts --apply-supported-architectures --workspace upstream
+
       - name: Install the rescoped workspace
         working-directory: upstream
         run: pnpm install --ignore-scripts
