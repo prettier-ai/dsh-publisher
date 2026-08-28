@@ -8,7 +8,7 @@
 
 - 一个轮询器：定时 workflow 读取官方仓库最新的 GitHub Release，判断该版本是否仍需要发布到 `@prettier-ai`。
 - 一个重发布器：当版本缺失时，workflow 将官方 tag 拉取到 runner 工作区，把可发布包名从 `@deepseek-ai/*` 改写为 `@prettier-ai/*`（仅针对打包路径的改写，不做产品改名），然后在该检出上打包并发布。
-- Overlay 脚本及其单元测试：`scripts/probe-upstream-release.ts`（决策）、`scripts/rescope-to-prettier-ai.ts`（改写）、`scripts/inject-deepseek-ai-compat.ts`（打包后 CLI 上的宿主侧 `@deepseek-ai/*` 兼容）、`scripts/publish-cli-tarball.ts`（仅发布该 CLI tarball，且按完整性跳过或拒绝覆盖）和 `scripts/publish-dshp.ts`（薄封装 `@prettier-ai/dshp`，只提供 `dshp` 命令）。
+- Overlay 脚本及其单元测试：`scripts/probe-upstream-release.ts`（决策）、`scripts/rescope-to-prettier-ai.ts`（改写）、`scripts/inject-deepseek-ai-compat.ts`（打包后 CLI 上的宿主侧 `@deepseek-ai/*` 兼容）、`scripts/publish-cli-tarball.ts`（仅发布该 CLI tarball，且按完整性跳过或拒绝覆盖）、`scripts/publish-dshp.ts`（薄封装 `@prettier-ai/dshp`，只提供 `dshp` 命令）和 `scripts/bundle-cli.ts`（从 lockfile 捆绑 CLI tarball）。
 
 ## 本仓库不是什么
 
@@ -29,12 +29,12 @@
    - `publish-only` —— 本仓库的跟踪 tag `prettier-ai/<version>` 已存在但 npm 缺少该版本（例如上一次运行完成打包但未能发布）。重活作业端到端重跑；发布按包幂等。
    - `sync` —— 全新版本。重活作业运行，结束后推送跟踪 tag。
 
-重活的 `sync` 作业拉取官方 tag（浅克隆），把 overlay 脚本复制到该检出上，在其中运行 `--apply` 与 `--check --applied`，安装改写后的 workspace，构建，先打包 `vendor` 家族再打包 `dsh` 家族，再向打包后的 CLI tarball 注入宿主侧 `@deepseek-ai/*` 兼容层以便现有 DSH 插件继续解析，将 tarball 上传为 workflow 产物，然后发布。
+重活的 `sync` 作业拉取官方 tag（浅克隆），把 overlay 脚本复制到该检出上，在其中运行 `--apply` 与 `--check --applied`，安装改写后的 workspace，构建，先打包 `vendor` 家族再打包 `dsh` 家族，再用 lockfile 捆绑包替换瘦 CLI tarball（对 `apps/cli` 做 `pnpm deploy` 并带上 production `node_modules`，从 `dependencies` 去掉 workspace 包名），在该捆绑包上保留宿主侧 `@deepseek-ai/*` 运行时 loader，将 tarball 上传为 workflow 产物，然后发布。
 
 ## 发布内容
 
-- `@prettier-ai/dsh` —— CLI，保留上游的 `dsh` bin。打包后的 tarball 含宿主侧 `@deepseek-ai/*` 兼容层（运行时模块 hook 与安装时 npm alias），使现有 DSH 插件继续工作。
-- `@prettier-ai/dshp` —— 薄封装，安装后提供 `dshp` 命令并运行与 `@prettier-ai/dsh` 相同的 CLI。需要 `dshp` 命令时安装 `@prettier-ai/dshp`；`@prettier-ai/dsh` 仍然只发布 `dsh`。
+- `@prettier-ai/dsh` —— CLI，保留上游的 `dsh` bin。发布的 tarball 内含 production `node_modules`，清单不再把 workspace 的 `@prettier-ai/*` 包列为 `dependencies`，因此 `npm install` 不会去解析那张 peer 图。仍带宿主侧 `@deepseek-ai/*` 运行时 loader（以及捆绑包内的 `@deepseek-ai/*` 符号链接），使现有 DSH 插件继续工作。
+- `@prettier-ai/dshp` —— 薄封装，安装后提供 `dshp` 命令并运行与 `@prettier-ai/dsh` 相同的 CLI。它唯一的依赖是上述捆绑后的 `@prettier-ai/dsh`。需要 `dshp` 命令时安装 `@prettier-ai/dshp`；`@prettier-ai/dsh` 仍然只发布 `dsh`。
 - `@prettier-ai/*` —— 官方发布中的各 workspace 包（core、vendor 与 landlock 家族），版本均与上游一致。
 
 改写覆盖包清单、随包发布的源码 specifier、lockfile、发布脚本以及与打包相关的 CI。它刻意不动 Markdown 正文、GitHub URL、产品名称、`description` 字段和上游 `LICENSE`，因此 tarball 内保留带 DeepSeek 版权声明的原始 MIT 文本。
@@ -51,7 +51,7 @@
 
 ### Pack CLI / Publish CLI
 
-`.github/workflows/publish-cli.yml` 仅手动触发（无定时）。它会对同一官方 tag 做 rescope、注入 `@deepseek-ai/*` 兼容层、**只**打包 `@prettier-ai/dsh`、从本仓库打包 `@prettier-ai/dshp`、上传这些 tarball，并在设置了 `NPM_TOKEN` 时发布。它不会打包或发布 vendor/dsh 家族。适用于该版本的 workspace 包已在 registry、只需补发 CLI（以及 `dshp` 封装）的情况。版本号仍与官方一致：本 workflow 不会自造后缀。若 `@prettier-ai/dsh@<version>` 已在 npm 且内容不同，CLI 发布会失败——请等待新的官方 tag，并在本次 run 的 artifacts 中查看 tarball。该次运行仍可发布 `@prettier-ai/dshp`，不会覆盖 `@prettier-ai/dsh`。
+`.github/workflows/publish-cli.yml` 仅手动触发（无定时）。它会对同一官方 tag 做 rescope，从已解析的 lockfile 捆绑 `@prettier-ai/dsh`（含运行时 `@deepseek-ai/*` loader），从本仓库打包 `@prettier-ai/dshp`，上传这些 tarball，并在设置了 `NPM_TOKEN` 时发布。它不会打包或发布 vendor/dsh 家族。适用于该版本的 workspace 包已在 registry、只需补发 CLI（以及 `dshp` 封装）的情况。版本号仍与官方一致：本 workflow 不会自造后缀。若 `@prettier-ai/dsh@<version>` 已在 npm 且内容不同，CLI 发布会失败——请等待新的官方 tag，并在本次 run 的 artifacts 中查看 tarball。该次运行仍可发布 `@prettier-ai/dshp`，不会覆盖 `@prettier-ai/dsh`。
 
 ### 跟踪引用
 

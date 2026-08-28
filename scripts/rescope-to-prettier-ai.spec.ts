@@ -32,6 +32,8 @@ describe('shouldRewritePath', () => {
     expect(shouldRewritePath('scripts/publish-cli-tarball.spec.ts')).toBe(false)
     expect(shouldRewritePath('scripts/publish-dshp.ts')).toBe(false)
     expect(shouldRewritePath('scripts/publish-dshp.spec.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/bundle-cli.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/bundle-cli.spec.ts')).toBe(false)
     expect(shouldRewritePath('packages/dshp/package.json')).toBe(false)
     expect(shouldRewritePath('packages/dshp/bin.js')).toBe(false)
   })

@@ -8,7 +8,7 @@ Standalone publisher that republishes official [DeepSeek Harness](https://github
 
 - A poller: a scheduled workflow reads the official repository's latest GitHub Release and decides whether that version still needs a `@prettier-ai` publication.
 - A republisher: when a version is missing, the workflow fetches the official tag into the runner workspace, rewrites the packable package names from `@deepseek-ai/*` to `@prettier-ai/*` (a pack-only rewrite — no product renaming), then packs and publishes from that checkout.
-- Overlay scripts plus their unit tests: `scripts/probe-upstream-release.ts` (the decision), `scripts/rescope-to-prettier-ai.ts` (the rewrite), `scripts/inject-deepseek-ai-compat.ts` (host-side `@deepseek-ai/*` compatibility on the packed CLI), `scripts/publish-cli-tarball.ts` (integrity-safe publish of that CLI tarball only), and `scripts/publish-dshp.ts` (thin `@prettier-ai/dshp` wrapper with a `dshp` bin).
+- Overlay scripts plus their unit tests: `scripts/probe-upstream-release.ts` (the decision), `scripts/rescope-to-prettier-ai.ts` (the rewrite), `scripts/inject-deepseek-ai-compat.ts` (host-side `@deepseek-ai/*` compatibility on the packed CLI), `scripts/publish-cli-tarball.ts` (integrity-safe publish of that CLI tarball only), and `scripts/publish-dshp.ts` (thin `@prettier-ai/dshp` wrapper with a `dshp` bin), and `scripts/bundle-cli.ts` (lockfile-bundled CLI tarball).
 
 ## What this repository is not
 
@@ -29,12 +29,12 @@ The cheap `decide` job sparse-checkouts only `scripts/probe-upstream-release.ts`
    - `publish-only` — this repository's tracking tag `prettier-ai/<version>` exists but npm lacks the version (for example a previous run packed but could not publish). The heavy job runs again end to end; publishing is idempotent per package.
    - `sync` — the version is new. The heavy job runs and pushes the tracking tag afterwards.
 
-The heavy `sync` job fetches the official tag (shallow clone), copies the overlay scripts onto that checkout, runs `--apply` and `--check --applied` there, installs the rescoped workspace, builds, packs the `vendor` family then the `dsh` family, injects host-side `@deepseek-ai/*` compatibility into the packed CLI tarball so existing DSH plugins keep resolving, uploads the tarballs as workflow artifacts, and publishes.
+The heavy `sync` job fetches the official tag (shallow clone), copies the overlay scripts onto that checkout, runs `--apply` and `--check --applied` there, installs the rescoped workspace, builds, packs the `vendor` family then the `dsh` family, replaces the thin CLI tarball with a lockfile-bundled package (`pnpm deploy` of `apps/cli` plus production `node_modules`, workspace names stripped from `dependencies`), keeps the host-side `@deepseek-ai/*` runtime loader on that bundle, uploads the tarballs as workflow artifacts, and publishes.
 
 ## What gets published
 
-- `@prettier-ai/dsh` — the CLI, with the upstream `dsh` bin. Packed tarballs include a host-side `@deepseek-ai/*` compatibility layer (runtime module hook plus install-time npm aliases) so existing DSH plugins keep working.
-- `@prettier-ai/dshp` — thin wrapper that installs a `dshp` command and runs the same CLI as `@prettier-ai/dsh`. Install `@prettier-ai/dshp` for a `dshp` command; `@prettier-ai/dsh` still ships `dsh`.
+- `@prettier-ai/dsh` — the CLI, with the upstream `dsh` bin. The published tarball bundles production `node_modules` and does not list the workspace `@prettier-ai/*` packages as `dependencies`, so `npm install` does not resolve that peer graph. It still ships the host-side `@deepseek-ai/*` runtime loader (plus physical `@deepseek-ai/*` symlinks inside the bundle) so existing DSH plugins keep working.
+- `@prettier-ai/dshp` — thin wrapper that installs a `dshp` command and runs the same CLI as `@prettier-ai/dsh`. Its only dependency is that bundled `@prettier-ai/dsh`. Install `@prettier-ai/dshp` for a `dshp` command; `@prettier-ai/dsh` still ships `dsh`.
 - `@prettier-ai/*` — the workspace packages of the official release (core, vendor, and landlock families), each at the upstream version.
 
 The rescope rewrites package manifests, shipped source specifiers, the lockfile, release scripts, and pack-related CI. It deliberately leaves Markdown prose, GitHub URLs, product titles, `description` fields, and the upstream `LICENSE` untouched, so tarballs ship the original MIT text with the DeepSeek copyright.
@@ -51,7 +51,7 @@ Run the `Sync upstream release` workflow from the Actions tab (or `gh workflow r
 
 ### Pack CLI / Publish CLI
 
-`.github/workflows/publish-cli.yml` is dispatch-only (no schedule). It rescopes the same official tag, injects `@deepseek-ai/*` compatibility, packs **only** `@prettier-ai/dsh`, packs `@prettier-ai/dshp` from this repository, uploads those tarballs, and publishes them when `NPM_TOKEN` is set. It does not pack or publish the vendor/dsh families. Use it when those workspace packages of that version are already on the registry and only the CLI (and `dshp` wrapper) need to ship. Versions still mirror the official release: this workflow does not invent a publisher-side suffix. If `@prettier-ai/dsh@<version>` is already on npm with different contents, CLI publish fails — wait for a new official tag, and inspect the tarball on the run's artifacts. `@prettier-ai/dshp` can still ship in that run without overwriting `@prettier-ai/dsh`.
+`.github/workflows/publish-cli.yml` is dispatch-only (no schedule). It rescopes the same official tag, bundles `@prettier-ai/dsh` from the resolved lockfile (with the runtime `@deepseek-ai/*` loader), packs `@prettier-ai/dshp` from this repository, uploads those tarballs, and publishes them when `NPM_TOKEN` is set. It does not pack or publish the vendor/dsh families. Use it when those workspace packages of that version are already on the registry and only the CLI (and `dshp` wrapper) need to ship. Versions still mirror the official release: this workflow does not invent a publisher-side suffix. If `@prettier-ai/dsh@<version>` is already on npm with different contents, CLI publish fails — wait for a new official tag, and inspect the tarball on the run's artifacts. `@prettier-ai/dshp` can still ship in that run without overwriting `@prettier-ai/dsh`.
 
 ### Tracking refs
 

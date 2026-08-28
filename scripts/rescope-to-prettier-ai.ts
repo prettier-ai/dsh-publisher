@@ -49,6 +49,8 @@ export const OVERLAY_SCRIPT_FILES: readonly string[] = [
   'scripts/publish-cli-tarball.spec.ts',
   'scripts/publish-dshp.ts',
   'scripts/publish-dshp.spec.ts',
+  'scripts/bundle-cli.ts',
+  'scripts/bundle-cli.spec.ts',
 ]
 
 /** Paths the rewrite must not touch: frozen upstream history and this overlay. */
