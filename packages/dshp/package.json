@@ -1,0 +1,22 @@
+{
+  "name": "@prettier-ai/dshp",
+  "version": "0.0.0",
+  "description": "Thin wrapper that installs a dshp command for the @prettier-ai/dsh CLI.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "dshp": "bin.js"
+  },
+  "files": [
+    "bin.js"
+  ],
+  "dependencies": {
+    "@prettier-ai/dsh": "0.0.0"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

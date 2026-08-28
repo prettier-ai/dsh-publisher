@@ -124,6 +124,8 @@ jobs:
              scripts/inject-deepseek-ai-compat.spec.ts \
              scripts/publish-cli-tarball.ts \
              scripts/publish-cli-tarball.spec.ts \
+             scripts/publish-dshp.ts \
+             scripts/publish-dshp.spec.ts \
              upstream/scripts/
 
       - uses: actions/setup-node@v6
@@ -168,6 +170,13 @@ jobs:
           node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --apply --from dist/npm
           node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --check --applied --from dist/npm
 
+      # Thin @prettier-ai/dshp wrapper. Packed from this repository, never from
+      # upstream/packages (the official workspace must not pick it up).
+      - name: Pack @prettier-ai/dshp
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/publish-dshp.ts --pack --version "${VERSION}" --out dist/npm-dshp
+
       # Artifacts are uploaded before publish so a missing token or a failed
       # publish still leaves the packed tarballs on the workflow run.
       - uses: actions/upload-artifact@v4
@@ -176,6 +185,7 @@ jobs:
           path: |
             upstream/dist/npm/*
             upstream/dist/npm-vendor/*
+            dist/npm-dshp/*
           if-no-files-found: error
           retention-days: 7
 
@@ -193,6 +203,7 @@ jobs:
           export NODE_AUTH_TOKEN="${NPM_TOKEN}"
           pnpm run release:publish --family vendor --from dist/npm-vendor
           pnpm run release:publish --family dsh --from dist/npm
+          node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-dshp.ts" --from "${GITHUB_WORKSPACE}/dist/npm-dshp"
 
       # The tag marks the version as processed so scheduled runs go back to the
       # cheap skip path. It points at this repository's HEAD, never at upstream

@@ -1,26 +1,31 @@
-# Pack and publish only `@prettier-ai/dsh`. Dispatch-only: no schedule.
+# Pack and publish `@prettier-ai/dsh` and the thin `@prettier-ai/dshp`
+# wrapper. Dispatch-only: no schedule.
 #
 # After the host-side `@deepseek-ai/*` compatibility layer lands, operators can
 # ship a new CLI tarball without republishing the vendor/dsh families (~230
 # packages). Use this when those workspace packages of the same version are
-# already on the registry.
+# already on the registry. The same dispatch also packs `dshp` so a CLI-only
+# run can ship `@prettier-ai/dshp` when `@prettier-ai/dsh` is already present.
 #
 # The job still fetches the official tag, rescopes the checkout, builds, packs
 # `apps/cli` only, injects the runtime loader and npm aliases into that tarball,
-# uploads it, and `npm publish`es it when NPM_TOKEN is set. It never calls
+# packs `@prettier-ai/dshp` from this repository, uploads both, and
+# `npm publish`es them when NPM_TOKEN is set. It never calls
 # `release:pack --family` or `release:publish --family`.
 #
 # Versions still mirror the official release. This workflow does not invent a
 # publisher-side version suffix. If `@prettier-ai/dsh@<version>` is already on
 # npm with different contents (for example a Sync run published that version
-# before the compatibility inject), publish fails on integrity mismatch — wait
-# for a new official tag, or inspect the tarball on this run's artifacts.
+# before the compatibility inject), CLI publish fails on integrity mismatch —
+# wait for a new official tag, or inspect the tarball on this run's artifacts.
+# `@prettier-ai/dshp` still publishes in that case when it is absent from npm;
+# it does not overwrite `@prettier-ai/dsh`.
 #
 # Optional input `tag`: empty uses the same probe as Sync (latest stable, else
 # newest non-draft including prereleases).
 #
 # Required secret: NPM_TOKEN (same as Sync). Missing token still packs and
-# uploads the CLI tarball, then skips npm publish. Never commit a token.
+# uploads the tarballs, then skips npm publish. Never commit a token.
 #
 # This workflow does not push the prettier-ai/<version> tracking tag.
 name: Pack CLI / Publish CLI
@@ -90,7 +95,7 @@ jobs:
     needs: decide
     # Pack even when the probe would skip a full-family Sync (version already
     # on npm): the artifact is still useful, and publish-cli-tarball.ts refuses
-    # to overwrite a different registry tarball.
+    # to overwrite a different registry tarball. dshp can still ship.
     if: needs.decide.outputs.tag != ''
     runs-on: ubuntu-24.04
     env:
@@ -119,6 +124,8 @@ jobs:
              scripts/inject-deepseek-ai-compat.spec.ts \
              scripts/publish-cli-tarball.ts \
              scripts/publish-cli-tarball.spec.ts \
+             scripts/publish-dshp.ts \
+             scripts/publish-dshp.spec.ts \
              upstream/scripts/
 
       - uses: actions/setup-node@v6
@@ -160,23 +167,38 @@ jobs:
           node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --apply --from dist/npm-cli
           node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --check --applied --from dist/npm-cli
 
+      - name: Pack @prettier-ai/dshp
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/publish-dshp.ts --pack --version "${VERSION}" --out dist/npm-dshp
+
       - uses: actions/upload-artifact@v4
         with:
           name: prettier-ai-dsh-cli-${{ needs.decide.outputs.version }}
-          path: upstream/dist/npm-cli/*
+          path: |
+            upstream/dist/npm-cli/*
+            dist/npm-dshp/*
           if-no-files-found: error
           retention-days: 7
 
-      - name: Publish the CLI tarball when NPM_TOKEN is present
+      - name: Publish the CLI and dshp tarballs when NPM_TOKEN is present
         working-directory: upstream
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "${NPM_TOKEN}" ]]; then
-            echo "NPM_TOKEN is unset: the CLI tarball was uploaded as a workflow artifact; skipping npm publish."
+            echo "NPM_TOKEN is unset: packed tarballs were uploaded as workflow artifacts; skipping npm publish."
             echo "Add a repository secret NPM_TOKEN with publish access to the prettier-ai npm org, then re-run Pack CLI / Publish CLI."
             exit 0
           fi
           export NODE_AUTH_TOKEN="${NPM_TOKEN}"
-          node --experimental-strip-types scripts/publish-cli-tarball.ts --from dist/npm-cli
+          # If @prettier-ai/dsh is already on npm with different bytes, refuse to
+          # overwrite it — but still publish @prettier-ai/dshp when that wrapper
+          # is missing at this version.
+          cli_status=0
+          if ! node --experimental-strip-types scripts/publish-cli-tarball.ts --from dist/npm-cli; then
+            cli_status=$?
+          fi
+          node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-dshp.ts" --from "${GITHUB_WORKSPACE}/dist/npm-dshp"
+          exit "${cli_status}"

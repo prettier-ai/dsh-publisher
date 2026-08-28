@@ -8,7 +8,7 @@
 
 - 一个轮询器：定时 workflow 读取官方仓库最新的 GitHub Release，判断该版本是否仍需要发布到 `@prettier-ai`。
 - 一个重发布器：当版本缺失时，workflow 将官方 tag 拉取到 runner 工作区，把可发布包名从 `@deepseek-ai/*` 改写为 `@prettier-ai/*`（仅针对打包路径的改写，不做产品改名），然后在该检出上打包并发布。
-- Overlay 脚本及其单元测试：`scripts/probe-upstream-release.ts`（决策）、`scripts/rescope-to-prettier-ai.ts`（改写）、`scripts/inject-deepseek-ai-compat.ts`（打包后 CLI 上的宿主侧 `@deepseek-ai/*` 兼容）和 `scripts/publish-cli-tarball.ts`（仅发布该 CLI tarball，且按完整性跳过或拒绝覆盖）。
+- Overlay 脚本及其单元测试：`scripts/probe-upstream-release.ts`（决策）、`scripts/rescope-to-prettier-ai.ts`（改写）、`scripts/inject-deepseek-ai-compat.ts`（打包后 CLI 上的宿主侧 `@deepseek-ai/*` 兼容）、`scripts/publish-cli-tarball.ts`（仅发布该 CLI tarball，且按完整性跳过或拒绝覆盖）和 `scripts/publish-dshp.ts`（薄封装 `@prettier-ai/dshp`，只提供 `dshp` 命令）。
 
 ## 本仓库不是什么
 
@@ -34,6 +34,7 @@
 ## 发布内容
 
 - `@prettier-ai/dsh` —— CLI，保留上游的 `dsh` bin。打包后的 tarball 含宿主侧 `@deepseek-ai/*` 兼容层（运行时模块 hook 与安装时 npm alias），使现有 DSH 插件继续工作。
+- `@prettier-ai/dshp` —— 薄封装，安装后提供 `dshp` 命令并运行与 `@prettier-ai/dsh` 相同的 CLI。需要 `dshp` 命令时安装 `@prettier-ai/dshp`；`@prettier-ai/dsh` 仍然只发布 `dsh`。
 - `@prettier-ai/*` —— 官方发布中的各 workspace 包（core、vendor 与 landlock 家族），版本均与上游一致。
 
 改写覆盖包清单、随包发布的源码 specifier、lockfile、发布脚本以及与打包相关的 CI。它刻意不动 Markdown 正文、GitHub URL、产品名称、`description` 字段和上游 `LICENSE`，因此 tarball 内保留带 DeepSeek 版权声明的原始 MIT 文本。
@@ -50,7 +51,7 @@
 
 ### Pack CLI / Publish CLI
 
-`.github/workflows/publish-cli.yml` 仅手动触发（无定时）。它会对同一官方 tag 做 rescope、注入 `@deepseek-ai/*` 兼容层、**只**打包 `@prettier-ai/dsh`、上传该 tarball，并在设置了 `NPM_TOKEN` 时发布。它不会打包或发布 vendor/dsh 家族。适用于该版本的 workspace 包已在 registry、只需补发 CLI tarball 的情况。版本号仍与官方一致：本 workflow 不会自造后缀。若 `@prettier-ai/dsh@<version>` 已在 npm 且内容不同，发布会失败——请等待新的官方 tag，并在本次 run 的 artifacts 中查看 tarball。
+`.github/workflows/publish-cli.yml` 仅手动触发（无定时）。它会对同一官方 tag 做 rescope、注入 `@deepseek-ai/*` 兼容层、**只**打包 `@prettier-ai/dsh`、从本仓库打包 `@prettier-ai/dshp`、上传这些 tarball，并在设置了 `NPM_TOKEN` 时发布。它不会打包或发布 vendor/dsh 家族。适用于该版本的 workspace 包已在 registry、只需补发 CLI（以及 `dshp` 封装）的情况。版本号仍与官方一致：本 workflow 不会自造后缀。若 `@prettier-ai/dsh@<version>` 已在 npm 且内容不同，CLI 发布会失败——请等待新的官方 tag，并在本次 run 的 artifacts 中查看 tarball。该次运行仍可发布 `@prettier-ai/dshp`，不会覆盖 `@prettier-ai/dsh`。
 
 ### 跟踪引用
 
