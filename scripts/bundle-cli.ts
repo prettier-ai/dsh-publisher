@@ -20,6 +20,13 @@
  * directories and pack with `--dereference` so remaining symlink members
  * become regular files too.
  *
+ * `pnpm deploy --prod --legacy` may still omit nested workspace packages that
+ * only appear as `workspace:^` (or `link:`) edges of vendor packages already
+ * in the deploy tree (cosmokit is the first crash). After deploy, this script
+ * walks deploy `node_modules` and copies missing workspace members in as real
+ * directories until the graph closes. It does not put those names back on the
+ * published CLI `dependencies`.
+ *
  * The packed bin stays `dsh` at `lib/bin.js`. This script does not add `dshp`.
  * Host-side `@deepseek-ai/*` compatibility is applied to the deploy directory
  * (runtime loader) before packing. Install-time npm aliases are not written:
@@ -30,12 +37,14 @@
  * Usage:
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm-cli
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm --replace
+ *   node --experimental-strip-types scripts/bundle-cli.ts --published-version --official <ver> [--suffix <id>]
  */
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
   cpSync,
   existsSync,
+  globSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -47,7 +56,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { injectPackageDir } from './inject-deepseek-ai-compat.ts'
@@ -57,13 +66,27 @@ export const CLI_BIN_NAME = 'dsh'
 export const CLI_BIN_PATH = 'lib/bin.js'
 export const CLI_PNPM_FILTER = './apps/cli'
 
+/** Nested workspace packages that must land in the packed tarball when present. */
+export const PACKED_NESTED_WORKSPACE_PACKAGES = [
+  '@prettier-ai/cosmokit',
+  '@prettier-ai/schemastery',
+] as const
+
 const GRAPH_SCOPES = ['@prettier-ai/', '@deepseek-ai/'] as const
 const INSTALL_SECTIONS = ['dependencies', 'optionalDependencies', 'peerDependencies'] as const
+const NPM_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
+const SUFFIX_ID = /^[0-9A-Za-z][0-9A-Za-z.-]*$/
 
 interface PackedIdentity {
   readonly name: string
   readonly version: string
   readonly file: string
+}
+
+/** Optional pack knobs. `workspace` closes nested workspace deps; `version` stamps only the CLI manifest. */
+export interface PackBundledOptions {
+  readonly workspace?: string | undefined
+  readonly version?: string | undefined
 }
 
 /**
@@ -96,6 +119,103 @@ export function scopedWorkspaceDependencyNames(
 ): string[] {
   if (dependencies === undefined) return []
   return Object.keys(dependencies).filter(name => GRAPH_SCOPES.some(scope => name.startsWith(scope)))
+}
+
+/**
+ * Join an official npm version with an operator-supplied Pack CLI suffix.
+ * Empty suffix keeps the official version. Non-empty becomes `{official}-{suffix}`.
+ * @param officialVersion - version from the official git tag / probe.
+ * @param suffix - optional `workflow_dispatch` input; not auto-incremented.
+ */
+export function publishedNpmVersion(officialVersion: string, suffix: string | undefined): string {
+  if (!isNpmVersion(officialVersion)) {
+    throw new Error(`bundle-cli: official version ${JSON.stringify(officialVersion)} is not a valid npm version`)
+  }
+  if (suffix === undefined || suffix === '') return officialVersion
+  if (suffix.trim() === '' || suffix.trim() !== suffix || /\s/.test(suffix) || suffix.includes('/')) {
+    throw new Error(
+      'bundle-cli: suffix must be non-empty after trim and must not contain whitespace or slashes',
+    )
+  }
+  if (!SUFFIX_ID.test(suffix) || suffix.includes('..') || suffix.endsWith('.') || suffix.endsWith('-')) {
+    throw new Error(`bundle-cli: suffix ${JSON.stringify(suffix)} is not a valid npm prerelease identifier`)
+  }
+  const version = `${officialVersion}-${suffix}`
+  if (!isNpmVersion(version)) {
+    throw new Error(`bundle-cli: ${JSON.stringify(version)} is not a valid npm version`)
+  }
+  return version
+}
+
+/**
+ * Parse the `packages:` list from a `pnpm-workspace.yaml`.
+ * @param text - file contents.
+ */
+export function parsePnpmWorkspacePackageGlobs(text: string): string[] {
+  const globs: string[] = []
+  let inPackages = false
+  for (const line of text.split(/\r?\n/)) {
+    if (!inPackages) {
+      if (/^packages:\s*(?:#.*)?$/.test(line)) inPackages = true
+      continue
+    }
+    if (/^[A-Za-z][\w-]*\s*:/.test(line)) break
+    const stripped = line.replace(/\s+#.*$/, '')
+    if (stripped.trim() === '') continue
+    const item = stripped.match(/^\s+-\s+(.+)$/)
+    if (item?.[1] === undefined) continue
+    const glob = item[1].trim().replace(/^['"]|['"]$/g, '')
+    if (glob !== '') globs.push(glob)
+  }
+  return globs
+}
+
+/**
+ * Map workspace package names to their directories in a rescoped checkout.
+ * @param workspaceRoot - official checkout root (after rescope).
+ */
+export function workspacePackageLocations(workspaceRoot: string): ReadonlyMap<string, string> {
+  const globs = readWorkspacePackageGlobs(workspaceRoot)
+  const map = new Map<string, string>()
+  for (const glob of globs) {
+    if (glob.startsWith('!')) continue
+    const pattern = `${glob.replace(/\/$/, '')}/package.json`
+    for (const relative of globSync(pattern, { cwd: workspaceRoot })) {
+      const abs = resolve(workspaceRoot, relative)
+      const name = readJsonObject(abs).name
+      if (typeof name !== 'string' || name === '') continue
+      map.set(name, dirname(abs))
+    }
+  }
+  return map
+}
+
+/**
+ * Copy missing workspace packages into the deploy `node_modules` until a pass
+ * adds nothing. Nested vendor edges (cosmokit via cordis) are the class of hole;
+ * this is not a cosmokit-only special case.
+ * @param deployDir - `pnpm deploy` output directory.
+ * @param workspaceRoot - rescoped checkout with `pnpm-workspace.yaml`.
+ */
+export function fillMissingWorkspacePackages(deployDir: string, workspaceRoot: string): readonly string[] {
+  const members = workspacePackageLocations(workspaceRoot)
+  const added: string[] = []
+  for (;;) {
+    const missing = missingWorkspaceDeps(deployDir, members)
+    if (missing.length === 0) break
+    let addedThisPass = 0
+    for (const name of missing) {
+      const src = members.get(name)
+      if (src === undefined) continue
+      const dest = join(deployDir, 'node_modules', ...name.split('/'))
+      if (existsSync(dest)) continue
+      copyWorkspacePackage(src, dest)
+      added.push(name)
+      addedThisPass += 1
+    }
+    if (addedThisPass === 0) break
+  }
+  return added
 }
 
 /**
@@ -197,14 +317,27 @@ export function materializeDeepseekAiAliases(nodeModulesDir: string): readonly s
  * Rewrite one deploy directory and pack it as `@prettier-ai/dsh`.
  * @param packageDir - directory with package.json and production node_modules.
  * @param outDir - pack destination.
+ * @param options - optional workspace (fill nested deps) and published version.
  */
-export function packBundledDirectory(packageDir: string, outDir: string): PackedIdentity {
+export function packBundledDirectory(
+  packageDir: string,
+  outDir: string,
+  options: PackBundledOptions = {},
+): PackedIdentity {
   const manifestPath = join(packageDir, 'package.json')
   if (!existsSync(manifestPath)) {
     throw new Error(`bundle-cli: ${manifestPath} does not exist`)
   }
   if (!existsSync(join(packageDir, 'node_modules'))) {
     throw new Error(`bundle-cli: ${packageDir} has no node_modules; pnpm deploy did not produce a bundle`)
+  }
+  const workspaceRoot = options.workspace
+  if (workspaceRoot !== undefined && workspaceRoot !== '') {
+    fillMissingWorkspacePackages(packageDir, workspaceRoot)
+  }
+  const publishedVersion = options.version
+  if (publishedVersion !== undefined && publishedVersion !== '') {
+    stampPackageVersion(packageDir, publishedVersion)
   }
   const bundled = bundleCliManifest(readJsonObject(manifestPath))
   writeFileSync(manifestPath, `${JSON.stringify(bundled, null, 2)}\n`)
@@ -240,6 +373,7 @@ export function packBundledDirectory(packageDir: string, outDir: string): Packed
   if (tarballHasSymlinks(file)) {
     throw new Error('bundle-cli: packed tarball contains symbolic links; npm publish rejects those with E415')
   }
+  assertPackedContainsNestedWorkspacePackages(file, packageDir, workspaceRoot)
   return { name: packed.name, version: packed.version, file }
 }
 
@@ -265,8 +399,14 @@ export function removePackedCliTarballs(directory: string): readonly string[] {
  * @param workspace - official checkout root (after rescope + pnpm install + build).
  * @param outDir - pack destination.
  * @param replace - drop any existing `@prettier-ai/dsh` tarball in `outDir` first.
+ * @param publishedVersion - optional npm version stamped only on the packed CLI.
  */
-export function deployAndBundleCli(workspace: string, outDir: string, replace: boolean): PackedIdentity {
+export function deployAndBundleCli(
+  workspace: string,
+  outDir: string,
+  replace: boolean,
+  publishedVersion?: string | undefined,
+): PackedIdentity {
   const cliManifest = join(workspace, 'apps/cli/package.json')
   if (!existsSync(cliManifest)) {
     throw new Error(`bundle-cli: ${cliManifest} does not exist`)
@@ -280,7 +420,11 @@ export function deployAndBundleCli(workspace: string, outDir: string, replace: b
   const packageDir = join(tmp, 'package')
   try {
     runPnpmDeploy(workspace, packageDir)
-    return packBundledDirectory(packageDir, outDir)
+    const filled = fillMissingWorkspacePackages(packageDir, workspace)
+    if (filled.length > 0) {
+      console.log(`bundle-cli: filled ${String(filled.length)} missing workspace package(s): ${filled.join(', ')}`)
+    }
+    return packBundledDirectory(packageDir, outDir, { workspace, version: publishedVersion })
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -331,6 +475,169 @@ function runPnpmDeploy(workspace: string, deployDir: string): void {
   }
   if (!existsSync(join(deployDir, 'node_modules'))) {
     throw new Error('bundle-cli: pnpm deploy produced no node_modules')
+  }
+}
+
+function stampPackageVersion(packageDir: string, version: string): void {
+  if (!isNpmVersion(version)) {
+    throw new Error(`bundle-cli: ${JSON.stringify(version)} is not a valid npm version`)
+  }
+  const path = join(packageDir, 'package.json')
+  const manifest = readJsonObject(path)
+  manifest.version = version
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`)
+}
+
+function isNpmVersion(version: string): boolean {
+  return NPM_VERSION.test(version)
+    && !version.includes('..')
+    && !version.endsWith('.')
+    && !version.endsWith('-')
+    && !version.endsWith('+')
+}
+
+function readWorkspacePackageGlobs(workspaceRoot: string): string[] {
+  const yamlPath = join(workspaceRoot, 'pnpm-workspace.yaml')
+  if (existsSync(yamlPath)) {
+    const globs = parsePnpmWorkspacePackageGlobs(readFileSync(yamlPath, 'utf8'))
+    if (globs.length === 0) {
+      throw new Error(`bundle-cli: ${yamlPath} has no packages: entries`)
+    }
+    return globs
+  }
+  const pkgPath = join(workspaceRoot, 'package.json')
+  if (existsSync(pkgPath)) {
+    const workspaces = readJsonObject(pkgPath).workspaces
+    if (Array.isArray(workspaces) && workspaces.every((item): item is string => typeof item === 'string')) {
+      return workspaces
+    }
+  }
+  throw new Error(`bundle-cli: ${workspaceRoot} has no pnpm-workspace.yaml`)
+}
+
+function missingWorkspaceDeps(
+  deployDir: string,
+  members: ReadonlyMap<string, string>,
+): string[] {
+  const nodeModules = join(deployDir, 'node_modules')
+  const missing: string[] = []
+  const seen = new Set<string>()
+  for (const manifestPath of collectDeployManifestPaths(deployDir)) {
+    const manifest = readJsonObject(manifestPath)
+    for (const section of INSTALL_SECTIONS) {
+      for (const name of Object.keys(stringRecord(manifest[section]))) {
+        if (name === CLI_PACKAGE_NAME || !members.has(name) || seen.has(name)) continue
+        if (existsSync(join(nodeModules, ...name.split('/')))) continue
+        seen.add(name)
+        missing.push(name)
+      }
+    }
+  }
+  return missing
+}
+
+function collectDeployManifestPaths(deployDir: string): string[] {
+  const paths: string[] = []
+  const rootManifest = join(deployDir, 'package.json')
+  if (existsSync(rootManifest)) paths.push(rootManifest)
+  const nodeModules = join(deployDir, 'node_modules')
+  if (existsSync(nodeModules)) walkNodeModulesForManifests(nodeModules, paths, new Set())
+  return paths
+}
+
+function tryReadDirents(dir: string) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+}
+
+function walkNodeModulesForManifests(dir: string, paths: string[], seen: Set<string>): void {
+  let real: string
+  try {
+    real = realpathSync(dir)
+  } catch {
+    return
+  }
+  if (seen.has(real)) return
+  seen.add(real)
+  const entries = tryReadDirents(dir)
+  if (entries === undefined) return
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    const full = join(dir, entry.name)
+    if (entry.name.startsWith('@')) {
+      walkScopeDir(full, paths, seen)
+      continue
+    }
+    addPackageManifest(full, paths, seen)
+  }
+}
+
+function walkScopeDir(scopeDir: string, paths: string[], seen: Set<string>): void {
+  const entries = tryReadDirents(scopeDir)
+  if (entries === undefined) return
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    addPackageManifest(join(scopeDir, entry.name), paths, seen)
+  }
+}
+
+function addPackageManifest(packageDir: string, paths: string[], seen: Set<string>): void {
+  const manifest = join(packageDir, 'package.json')
+  if (existsSync(manifest)) paths.push(manifest)
+  const nested = join(packageDir, 'node_modules')
+  if (existsSync(nested)) walkNodeModulesForManifests(nested, paths, seen)
+}
+
+function copyWorkspacePackage(src: string, dest: string): void {
+  mkdirSync(dirname(dest), { recursive: true })
+  cpSync(src, dest, {
+    recursive: true,
+    dereference: true,
+    force: false,
+    errorOnExist: true,
+    filter: (source: string) => basename(source) !== 'node_modules',
+  })
+  assertNoLinks(dest)
+}
+
+function assertNoLinks(dir: string): void {
+  const entries = readdirSync(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    const full = join(dir, entry.name)
+    if (entry.isSymbolicLink()) {
+      throw new Error(`bundle-cli: copied package still contains symlink ${full}`)
+    }
+    const stat = lstatSync(full)
+    if (stat.isFile() && stat.nlink > 1) {
+      throw new Error(`bundle-cli: copied package still contains hardlink ${full}`)
+    }
+    if (entry.isDirectory()) assertNoLinks(full)
+  }
+}
+
+function assertPackedContainsNestedWorkspacePackages(
+  file: string,
+  packageDir: string,
+  workspaceRoot: string | undefined,
+): void {
+  const required = new Set<string>()
+  if (workspaceRoot !== undefined && workspaceRoot !== '') {
+    const members = workspacePackageLocations(workspaceRoot)
+    for (const name of PACKED_NESTED_WORKSPACE_PACKAGES) {
+      if (members.has(name)) required.add(name)
+    }
+  }
+  for (const name of PACKED_NESTED_WORKSPACE_PACKAGES) {
+    if (existsSync(join(packageDir, 'node_modules', ...name.split('/')))) required.add(name)
+  }
+  for (const name of required) {
+    const prefix = `package/node_modules/${name}/`
+    if (!tarballHasPathPrefix(file, prefix)) {
+      throw new Error(`bundle-cli: packed tarball is missing ${prefix}`)
+    }
   }
 }
 
@@ -450,15 +757,32 @@ function main(): void {
       workspace: { type: 'string' },
       out: { type: 'string' },
       replace: { type: 'boolean', default: false },
+      version: { type: 'string' },
+      official: { type: 'string' },
+      suffix: { type: 'string' },
+      'published-version': { type: 'boolean', default: false },
     },
     allowPositionals: false,
   })
+  if (values['published-version'] === true) {
+    const official = values.official
+    if (official === undefined || official === '') {
+      throw new Error('bundle-cli: --published-version requires --official')
+    }
+    process.stdout.write(`${publishedNpmVersion(official, values.suffix)}\n`)
+    return
+  }
   const workspace = values.workspace
   const out = values.out
   if (workspace === undefined || workspace === '' || out === undefined || out === '') {
     throw new Error('bundle-cli: --workspace <dir> and --out <dir> are required')
   }
-  const packed = deployAndBundleCli(resolve(workspace), resolve(out), values.replace === true)
+  const packed = deployAndBundleCli(
+    resolve(workspace),
+    resolve(out),
+    values.replace === true,
+    values.version,
+  )
   console.log(`bundle-cli: packed ${packed.name}@${packed.version} -> ${packed.file}`)
 }
 

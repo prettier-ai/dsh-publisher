@@ -4,8 +4,9 @@
  * Used by the dispatch-only Pack CLI / Publish CLI workflow. It never walks a
  * release family and never calls official `release:publish --family`. If the
  * version is already on the registry, the local tarball must match the
- * published integrity: a mismatch fails instead of overwriting or inventing a
- * publisher-side version suffix. Wait for a new official tag.
+ * published integrity: a mismatch fails instead of overwriting. Pack CLI does
+ * not invent a suffix when that input is empty; dispatch with an operator-supplied
+ * suffix to publish the same official tag under a new npm version.
  *
  * After `npm publish` (or a skip), the script re-fetches the version document.
  * HTTP 404 is a failure even if the CLI printed success. `npm publish` streams
@@ -55,15 +56,15 @@ export function decideCliTarballPublish(
 
 /**
  * Operator-facing error when the version is already on npm with different bytes.
- * This publisher does not invent a version suffix.
+ * Empty Pack CLI suffix does not invent a version; use the suffix input instead.
  * @param name - package name.
  * @param version - exact version.
  */
 export function cliPublishConflictMessage(name: string, version: string): string {
   return (
     `${name}@${version} is already published with different content. `
-    + 'This workflow does not invent a publisher-side version suffix and will not overwrite the registry tarball. '
-    + 'Wait for a new official tag (or dispatch Pack CLI / Publish CLI with that tag). '
+    + 'This workflow does not invent a publisher-side version suffix when Pack CLI suffix is empty and will not overwrite the registry tarball. '
+    + 'Dispatch Pack CLI / Publish CLI with an operator-supplied suffix to publish the same official tag under a new npm version, or wait for a new official tag. '
     + 'The tarball from this run remains on the workflow artifacts.'
   )
 }

@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
   chmodSync,
+  existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -22,10 +23,13 @@ import {
   CLI_BIN_NAME,
   CLI_BIN_PATH,
   CLI_PACKAGE_NAME,
+  fillMissingWorkspacePackages,
   isPublishedGraphDependency,
   materializeDeepseekAiAliases,
   packBundledDirectory,
+  parsePnpmWorkspacePackageGlobs,
   prettierAiDshStarDependencyNames,
+  publishedNpmVersion,
   removePackedCliTarballs,
   scopedWorkspaceDependencyNames,
   tarballHasHardLinks,
@@ -45,7 +49,7 @@ const THIN_CLI_DEPS: Record<string, string> = {
   'js-yaml': '^4.2.0',
 }
 
-function writeDeployFixture(packageDir: string): void {
+function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, string>): void {
   mkdirSync(join(packageDir, 'lib'), { recursive: true })
   mkdirSync(join(packageDir, 'node_modules/@prettier-ai/cordis'), { recursive: true })
   mkdirSync(join(packageDir, 'node_modules/@prettier-ai/dsh-client-ui-conversation'), { recursive: true })
@@ -63,10 +67,15 @@ function writeDeployFixture(packageDir: string): void {
   }, null, 2)}\n`)
   writeFileSync(join(packageDir, 'lib/bin.js'), '#!/usr/bin/env node\nconsole.log("upstream-cli")\n')
   chmodSync(join(packageDir, 'lib/bin.js'), 0o755)
-  writeFileSync(join(packageDir, 'node_modules/@prettier-ai/cordis/package.json'), `${JSON.stringify({
+  const cordisManifest: Record<string, unknown> = {
     name: '@prettier-ai/cordis',
     version: '4.0.1',
-  }, null, 2)}\n`)
+  }
+  if (cordisDeps !== undefined) cordisManifest.dependencies = cordisDeps
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/cordis/package.json'),
+    `${JSON.stringify(cordisManifest, null, 2)}\n`,
+  )
   writeFileSync(
     join(packageDir, 'node_modules/@prettier-ai/dsh-client-ui-conversation/package.json'),
     `${JSON.stringify({ name: '@prettier-ai/dsh-client-ui-conversation', version: VERSION }, null, 2)}\n`,
@@ -86,6 +95,45 @@ function writeFilesToInflateTarListing(dir: string): void {
   }
 }
 
+function writeMiniWorkspace(root: string): void {
+  writeFileSync(join(root, 'pnpm-workspace.yaml'), [
+    'packages:',
+    '  - vendor/*',
+    '  - packages/*/*',
+    '  # Product assemblies over the package tier; apps/cli owns the dsh bin.',
+    '  - apps/*',
+    '',
+    'linkWorkspacePackages: true',
+    '',
+  ].join('\n'))
+  mkdirSync(join(root, 'apps/cli'), { recursive: true })
+  mkdirSync(join(root, 'vendor/cordis'), { recursive: true })
+  mkdirSync(join(root, 'vendor/cosmokit/lib'), { recursive: true })
+  mkdirSync(join(root, 'vendor/schemastery'), { recursive: true })
+  writeFileSync(join(root, 'apps/cli/package.json'), `${JSON.stringify({
+    name: CLI_PACKAGE_NAME,
+    version: VERSION,
+    bin: { [CLI_BIN_NAME]: CLI_BIN_PATH },
+    dependencies: { '@prettier-ai/cordis': 'workspace:^' },
+  }, null, 2)}\n`)
+  writeFileSync(join(root, 'vendor/cordis/package.json'), `${JSON.stringify({
+    name: '@prettier-ai/cordis',
+    version: '4.0.1',
+    dependencies: { '@prettier-ai/cosmokit': 'workspace:^' },
+  }, null, 2)}\n`)
+  writeFileSync(join(root, 'vendor/cosmokit/package.json'), `${JSON.stringify({
+    name: '@prettier-ai/cosmokit',
+    version: '1.8.2',
+    dependencies: { '@prettier-ai/schemastery': 'workspace:^' },
+  }, null, 2)}\n`)
+  writeFileSync(join(root, 'vendor/cosmokit/lib/index.js'), 'export const ok = true\n')
+  symlinkSync('index.js', join(root, 'vendor/cosmokit/lib/alias.js'))
+  writeFileSync(join(root, 'vendor/schemastery/package.json'), `${JSON.stringify({
+    name: '@prettier-ai/schemastery',
+    version: '3.16.1',
+  }, null, 2)}\n`)
+}
+
 function packThinCli(parent: string, name: string, version: string, tarballName: string): string {
   const packageDir = join(parent, 'package')
   mkdirSync(packageDir, { recursive: true })
@@ -102,6 +150,57 @@ describe('isPublishedGraphDependency', () => {
     expect(isPublishedGraphDependency('@deepseek-ai/cordis', 'npm:@prettier-ai/cordis@4.0.1')).toBe(true)
     expect(isPublishedGraphDependency('leftover', 'workspace:^')).toBe(true)
     expect(isPublishedGraphDependency('commander', '^15.0.0')).toBe(false)
+  })
+})
+
+describe('publishedNpmVersion', () => {
+  it('keeps the official version when the suffix is empty', () => {
+    expect(publishedNpmVersion('0.1.1-rc.2', undefined)).toBe('0.1.1-rc.2')
+    expect(publishedNpmVersion('0.1.1-rc.2', '')).toBe('0.1.1-rc.2')
+    expect(publishedNpmVersion('0.1.1', '')).toBe('0.1.1')
+  })
+
+  it('joins with a single hyphen and treats the result as a prerelease', () => {
+    expect(publishedNpmVersion('0.1.1-rc.2', 'bundle.1')).toBe('0.1.1-rc.2-bundle.1')
+    expect(publishedNpmVersion('0.1.1', 'bundle.1')).toBe('0.1.1-bundle.1')
+    expect(publishedNpmVersion('0.1.1', 'test.2')).toBe('0.1.1-test.2')
+    expect(publishedNpmVersion('0.1.1-bundle.1', undefined).includes('-')).toBe(true)
+    expect(publishedNpmVersion('0.1.1', 'bundle.1').includes('-')).toBe(true)
+  })
+
+  it('rejects empty-after-trim, whitespace, slashes, and invalid identifiers', () => {
+    expect(() => publishedNpmVersion('0.1.1', '  ')).toThrow(/whitespace or slashes/)
+    expect(() => publishedNpmVersion('0.1.1', ' bundle.1')).toThrow(/whitespace or slashes/)
+    expect(() => publishedNpmVersion('0.1.1', 'bundle.1 ')).toThrow(/whitespace or slashes/)
+    expect(() => publishedNpmVersion('0.1.1', 'bundle 1')).toThrow(/whitespace or slashes/)
+    expect(() => publishedNpmVersion('0.1.1', 'bundle/1')).toThrow(/whitespace or slashes/)
+    expect(() => publishedNpmVersion('0.1.1', '-bundle.1')).toThrow(/prerelease identifier/)
+    expect(() => publishedNpmVersion('0.1.1', 'bundle..1')).toThrow(/prerelease identifier/)
+  })
+})
+
+describe('parsePnpmWorkspacePackageGlobs', () => {
+  it('reads official-shaped packages lists and stops at the next top-level key', () => {
+    expect(parsePnpmWorkspacePackageGlobs([
+      'packages:',
+      '  - vendor/*',
+      '  - packages/*/*',
+      '  # The Landlock launcher keeps native build scripts separate.',
+      '  - native/landlock-run',
+      '  - native/landlock-run/packages/*',
+      "  - 'apps/*'",
+      '  - website',
+      '',
+      'linkWorkspacePackages: true',
+      '',
+    ].join('\n'))).toEqual([
+      'vendor/*',
+      'packages/*/*',
+      'native/landlock-run',
+      'native/landlock-run/packages/*',
+      'apps/*',
+      'website',
+    ])
   })
 })
 
@@ -151,6 +250,26 @@ describe('bundleCliManifest', () => {
     ])
     expect(bundledFilesField(['lib/*.js'])).toEqual(['lib/*.js', 'node_modules'])
     expect(bundledFilesField(['lib/*.js', 'node_modules'])).toEqual(['lib/*.js', 'node_modules'])
+  })
+})
+
+describe('fillMissingWorkspacePackages', () => {
+  it('copies nested workspace deps as real directories, including transitive edges', () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-bundle-ws-'))
+    writeMiniWorkspace(workspace)
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-deploy-hole-'))
+    writeDeployFixture(packageDir, {
+      '@prettier-ai/cosmokit': 'workspace:^',
+      leftover: 'workspace:^',
+    })
+    expect(existsSync(join(packageDir, 'node_modules/@prettier-ai/cosmokit'))).toBe(false)
+    const added = [...fillMissingWorkspacePackages(packageDir, workspace)].sort()
+    expect(added).toEqual(['@prettier-ai/cosmokit', '@prettier-ai/schemastery'])
+    expect(existsSync(join(packageDir, 'node_modules/@prettier-ai/cosmokit/package.json'))).toBe(true)
+    expect(existsSync(join(packageDir, 'node_modules/@prettier-ai/schemastery/package.json'))).toBe(true)
+    expect(existsSync(join(packageDir, 'node_modules/leftover'))).toBe(false)
+    expect(lstatSync(join(packageDir, 'node_modules/@prettier-ai/cosmokit/lib/alias.js')).isSymbolicLink()).toBe(false)
+    expect(fillMissingWorkspacePackages(packageDir, workspace)).toEqual([])
   })
 })
 
@@ -273,6 +392,33 @@ describe('packBundledDirectory', () => {
     expect(tarballHasSymlinks(packed.file)).toBe(false)
     expect(() => checkAppliedCompat(out)).not.toThrow()
   })
+
+  it('fills nested workspace packages into the packed tarball and stamps a published version', () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-bundle-ws-pack-'))
+    writeMiniWorkspace(workspace)
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-deploy-pack-'))
+    writeDeployFixture(packageDir, { '@prettier-ai/cosmokit': 'workspace:^' })
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-nested-out-'))
+    const published = '0.1.1-rc.2-bundle.1'
+    const packed = packBundledDirectory(packageDir, out, { workspace, version: published })
+    expect(packed.version).toBe(published)
+    expect(packed.file).toBe(join(out, `prettier-ai-dsh-${published}.tgz`))
+
+    const manifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/package.json'], { encoding: 'utf8' }),
+    ) as { version: string; dependencies?: Record<string, string> }
+    expect(manifest.version).toBe(published)
+    expect(manifest.dependencies).toBeUndefined()
+    expect(scopedWorkspaceDependencyNames(manifest.dependencies)).toEqual([])
+
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@prettier-ai/cosmokit/')).toBe(true)
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@prettier-ai/cosmokit/package.json')).toBe(true)
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@prettier-ai/schemastery/package.json')).toBe(true)
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@deepseek-ai/cosmokit')).toBe(true)
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/leftover')).toBe(false)
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
+  })
 })
 
 describe('tarballHasPathPrefix', () => {
@@ -391,6 +537,17 @@ describe('workflows', () => {
     expect(cli).not.toContain('pnpm --dir apps/cli pack')
     expect(cli).not.toMatch(/^\s+- cron:/m)
     expect(cli).not.toMatch(/^\s+pnpm run release:pack --family/m)
+  })
+
+  it('lets Pack CLI take an operator-supplied suffix and keeps Sync suffix-free', () => {
+    const sync = readFileSync(new URL('../.github/workflows/sync-upstream-release.yml', import.meta.url), 'utf8')
+    const cli = readFileSync(new URL('../.github/workflows/publish-cli.yml', import.meta.url), 'utf8')
+    expect(cli).toMatch(/^\s+suffix:\s*$/m)
+    expect(cli).toContain('--published-version --official')
+    expect(cli).toContain('bundle-cli.ts --workspace . --out dist/npm-cli --version')
+    expect(cli).toContain('publish-dshp.ts --pack --version "${PUBLISHED_VERSION}"')
+    expect(sync).not.toMatch(/^\s+suffix:\s*$/m)
+    expect(sync).not.toContain('--published-version')
   })
 })
 
