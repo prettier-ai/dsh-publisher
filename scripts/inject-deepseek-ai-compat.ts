@@ -23,6 +23,10 @@
  * 1. Runtime (required): a Node module hook registered from the CLI bin so
  *    `import '@deepseek-ai/cordis'` (and every other `@deepseek-ai/*`
  *    specifier) resolves to `@prettier-ai/cordis` from this installation.
+ *    Host `@prettier-ai/*` specifiers (plugin names expanded from rescoped
+ *    bundles) also resolve from this installation; official profiles only
+ *    install `@deepseek-ai/*`. Third-party profile plugins stay in
+ *    `$DSH_HOME/profiles/<name>/node_modules`.
  * 2. Install-time: npm aliases `@deepseek-ai/<name>` →
  *    `npm:@prettier-ai/<name>@<same range>` on each `@prettier-ai/*`
  *    dependency, so `healProfilesModuleFallback` and `resolve.paths` still
@@ -293,6 +297,11 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
         + '(Node 24 resolveSync rejects a Promise url)',
       )
     }
+    if (!body.includes('function isHostSpecifier')) {
+      failures.push(
+        `${filename}: ${relPath} must resolve host @prettier-ai/* specifiers from the CLI parent`,
+      )
+    }
     const inner = innerBinRelPath(relPath)
     if (!tarballHasMember(tarball, `package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
@@ -441,20 +450,24 @@ function isBarePackageSpecifier(specifier) {
   return true
 }
 
+function isHostSpecifier(specifier) {
+  return typeof specifier === 'string' && (specifier === TO.slice(0, -1) || specifier.startsWith(TO))
+}
+
 function shouldResolveFromProfile(specifier, parentURL) {
   if (!isBarePackageSpecifier(specifier)) return false
-  if (specifier === TO.slice(0, -1) || specifier.startsWith(TO)) return false
+  if (isHostSpecifier(specifier)) return false
   if (parentIsUnderProfiles(parentURL)) return false
   return true
 }
 
 function resolveMapped(specifier, context, nextResolve, cliParentURL) {
   const mapped = mapSpecifier(specifier)
-  if (mapped !== undefined) {
+  if (mapped !== undefined || isHostSpecifier(specifier)) {
     try {
       // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
       // Returning a Promise makes url undefined (ERR_INVALID_RETURN_PROPERTY_VALUE).
-      return nextResolve(mapped, { ...context, parentURL: cliParentURL })
+      return nextResolve(mapped ?? specifier, { ...context, parentURL: cliParentURL })
     } catch {
       return nextResolve(specifier, context)
     }
@@ -575,18 +588,24 @@ function isBarePackageSpecifier(specifier) {
   return true
 }
 
+function isHostSpecifier(specifier) {
+  return typeof specifier === 'string' && (specifier === TO.slice(0, -1) || specifier.startsWith(TO))
+}
+
 function shouldResolveFromProfile(specifier, parentURL) {
   if (!isBarePackageSpecifier(specifier)) return false
-  if (specifier === TO.slice(0, -1) || specifier.startsWith(TO)) return false
+  if (isHostSpecifier(specifier)) return false
   if (parentIsUnderProfiles(parentURL)) return false
   return true
 }
 
 export async function resolve(specifier, context, nextResolve) {
-  if (typeof specifier === 'string' && specifier.startsWith(FROM)) {
-    const mapped = TO + specifier.slice(FROM.length)
+  const mapped = typeof specifier === 'string' && specifier.startsWith(FROM)
+    ? TO + specifier.slice(FROM.length)
+    : undefined
+  if (mapped !== undefined || isHostSpecifier(specifier)) {
     try {
-      return await nextResolve(mapped, { ...context, parentURL: cliParentURL || context.parentURL })
+      return await nextResolve(mapped ?? specifier, { ...context, parentURL: cliParentURL || context.parentURL })
     } catch {
       return nextResolve(specifier, context)
     }

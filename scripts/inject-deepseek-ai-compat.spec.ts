@@ -160,8 +160,11 @@ describe('injectPackageDir', () => {
     expect(wrapper.includes(DEEPSEEK_AI_COMPAT_MARKER)).toBe(true)
     expect(wrapper).not.toMatch(/async function resolveMapped/)
     expect(wrapper).toMatch(/function resolveMapped\(/)
+    expect(wrapper).toMatch(/function isHostSpecifier/)
     expect(readFileSync(join(dir, 'lib/bin.upstream.js'), 'utf8')).toContain('upstream-cli')
-    expect(readFileSync(join(dir, 'lib/deepseek-ai-compat-loader.js'), 'utf8')).toContain('@deepseek-ai/')
+    const loader = readFileSync(join(dir, 'lib/deepseek-ai-compat-loader.js'), 'utf8')
+    expect(loader).toContain('@deepseek-ai/')
+    expect(loader).toMatch(/function isHostSpecifier/)
     expect(readFileSync(overlay, 'utf8')).toBe(overlayBody)
 
     const second = injectPackageDir(dir)
@@ -321,6 +324,7 @@ describe('runtime hook', () => {
     const wrapper = readFileSync(join(dshDir, 'lib/bin.js'), 'utf8')
     expect(wrapper).not.toMatch(/async function resolveMapped/)
     expect(wrapper).toMatch(/function resolveMapped\(/)
+    expect(wrapper).toMatch(/function isHostSpecifier/)
     expect(wrapper).toContain('profileParentURLs')
     expect(JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8')).bin).toEqual({ dsh: 'lib/bin.js' })
     expect(JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8')).bin).not.toHaveProperty('dshp')
@@ -344,6 +348,86 @@ describe('runtime hook', () => {
       'from-profile-subagent-max',
       'from-profile-sidebar',
       'from-prettier-ai',
+    ])
+  })
+
+  it('resolves profile-parent @prettier-ai/* from the CLI and leaves third-party plugins in the profile', () => {
+    const root = makeTemp('dsh-compat-profile-parent-')
+    const dshDir = join(root, 'prefix/node_modules/@prettier-ai/dsh')
+    writeCliFixture(dshDir, {
+      binSource: [
+        '#!/usr/bin/env node',
+        'const target = process.argv[2]',
+        'if (typeof target !== "string") throw new Error("missing module")',
+        'await import(target)',
+        '',
+      ].join('\n'),
+    })
+    writeBarePlugin(join(dshDir, 'node_modules/@prettier-ai/cordis'), '@prettier-ai/cordis', 'from-prettier-ai')
+    writeBarePlugin(
+      join(dshDir, 'node_modules/@prettier-ai/cordis-plugin-timer'),
+      '@prettier-ai/cordis-plugin-timer',
+      'from-cli-timer',
+    )
+    writeBarePlugin(join(dshDir, 'node_modules/dshmarket'), 'dshmarket', 'from-cli-tarball')
+
+    const dshHome = join(root, 'dsh-home')
+    const profileDir = join(dshHome, 'profiles/web')
+    const profileNm = join(profileDir, 'node_modules')
+    mkdirSync(profileDir, { recursive: true })
+    writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify({
+      name: 'web',
+      type: 'module',
+    }, null, 2)}\n`)
+    writeBarePlugin(join(profileNm, '@deepseek-ai/cordis'), '@deepseek-ai/cordis', 'from-official-profile')
+    writeBarePlugin(join(profileNm, 'dshmarket'), 'dshmarket', 'from-profile-dshmarket')
+    writeBarePlugin(join(profileNm, '@dsh-ssh/dsh-ssh'), '@dsh-ssh/dsh-ssh', 'from-profile-dsh-ssh')
+    writeBarePlugin(join(profileNm, '@aaravarr/dsh-subagent-max'), '@aaravarr/dsh-subagent-max', 'from-profile-subagent-max')
+    writeBarePlugin(join(profileNm, 'dsh-subagent-sidebar'), 'dsh-subagent-sidebar', 'from-profile-sidebar')
+    writeFileSync(join(profileDir, 'load.js'), [
+      'import { id as timer } from "@prettier-ai/cordis-plugin-timer"',
+      'import { id as cordis } from "@deepseek-ai/cordis"',
+      'import { id as market } from "dshmarket"',
+      'import { id as ssh } from "@dsh-ssh/dsh-ssh"',
+      'import { id as subagent } from "@aaravarr/dsh-subagent-max"',
+      'import { id as sidebar } from "dsh-subagent-sidebar"',
+      'if (timer !== "from-cli-timer") throw new Error(`timer ${timer}`)',
+      'if (cordis !== "from-prettier-ai") throw new Error(`cordis ${cordis}`)',
+      'if (market !== "from-profile-dshmarket") throw new Error(`market ${market}`)',
+      'if (ssh !== "from-profile-dsh-ssh") throw new Error(`ssh ${ssh}`)',
+      'if (subagent !== "from-profile-subagent-max") throw new Error(`subagent ${subagent}`)',
+      'if (sidebar !== "from-profile-sidebar") throw new Error(`sidebar ${sidebar}`)',
+      'console.log(timer)',
+      'console.log(cordis)',
+      'console.log(market)',
+      'console.log(ssh)',
+      'console.log(subagent)',
+      'console.log(sidebar)',
+      '',
+    ].join('\n'))
+
+    injectPackageDir(dshDir)
+    const wrapper = readFileSync(join(dshDir, 'lib/bin.js'), 'utf8')
+    expect(wrapper).not.toMatch(/async function resolveMapped/)
+    expect(wrapper).toMatch(/function resolveMapped\(/)
+    expect(wrapper).toMatch(/function isHostSpecifier/)
+
+    mkdirSync(join(root, 'elsewhere'), { recursive: true })
+    const result = execFileSync(process.execPath, [
+      join(dshDir, 'lib/bin.js'),
+      pathToFileURL(join(profileDir, 'load.js')).href,
+    ], {
+      encoding: 'utf8',
+      cwd: join(root, 'elsewhere'),
+      env: { ...process.env, DSH_HOME: dshHome },
+    })
+    expect(result.trim().split('\n')).toEqual([
+      'from-cli-timer',
+      'from-prettier-ai',
+      'from-profile-dshmarket',
+      'from-profile-dsh-ssh',
+      'from-profile-subagent-max',
+      'from-profile-sidebar',
     ])
   })
 })
