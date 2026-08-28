@@ -24,6 +24,10 @@ describe('probeUpstreamRelease', () => {
     }
   }
 
+  function manifest(version: string): string {
+    return Buffer.from(JSON.stringify({ name: '@deepseek-ai/dsh', version })).toString('base64')
+  }
+
   it('skips when npm already has the entry version', async () => {
     const result = await probeUpstreamRelease(
       { tag: '' },
@@ -70,12 +74,13 @@ describe('probeUpstreamRelease', () => {
     })
   })
 
-  it('skips while upstream has published no non-prerelease release at all', async () => {
+  it('skips when upstream has published no GitHub Release at all', async () => {
     const result = await probeUpstreamRelease(
       { tag: '' },
       {
         fetchJson: async (url: string) => {
           if (url.endsWith('/releases/latest')) throw new Error(`${url} failed: 404 Not Found`)
+          if (url.includes('/releases?per_page=1')) return []
           throw new Error(`unexpected url ${url}`)
         },
         npmHasVersion: () => false,
@@ -83,18 +88,127 @@ describe('probeUpstreamRelease', () => {
       },
     )
     expect(result.action).toBe('skip')
-    expect(result.reason).toContain('no non-prerelease GitHub Release')
+    expect(result.tag).toBe('')
+    expect(result.reason).toContain('no GitHub Release')
   })
 
-  it('rejects a draft or prerelease answer from /releases/latest', async () => {
-    await expect(probeUpstreamRelease(
+  it('falls back to the newest prerelease when /releases/latest 404s', async () => {
+    const result = await probeUpstreamRelease(
       { tag: '' },
       {
-        fetchJson: async () => ({ tag_name: 'dsh-v1.2.3-alpha.0', draft: false, prerelease: true }),
+        fetchJson: async (url: string) => {
+          if (url.endsWith('/releases/latest')) throw new Error(`${url} failed: 404 Not Found`)
+          if (url.includes('/releases?per_page=1')) {
+            return [{ tag_name: 'dsh-v1.2.3-alpha.4', draft: false, prerelease: true }]
+          }
+          if (url.includes('/contents/apps/cli/package.json')) {
+            return { encoding: 'base64', content: manifest('1.2.3-alpha.4') }
+          }
+          throw new Error(`unexpected url ${url}`)
+        },
         npmHasVersion: () => false,
         gitHasTag: () => false,
       },
-    )).rejects.toThrow(/draft or prerelease/)
+    )
+    expect(result).toMatchObject({
+      action: 'sync',
+      tag: 'dsh-v1.2.3-alpha.4',
+      version: '1.2.3-alpha.4',
+    })
+  })
+
+  it('skips the newest prerelease when npm already has that version', async () => {
+    const result = await probeUpstreamRelease(
+      { tag: '' },
+      {
+        fetchJson: async (url: string) => {
+          if (url.endsWith('/releases/latest')) throw new Error(`${url} failed: 404 Not Found`)
+          if (url.includes('/releases?per_page=1')) {
+            return [{ tag_name: 'dsh-v1.2.3-alpha.4', draft: false, prerelease: true }]
+          }
+          if (url.includes('/contents/apps/cli/package.json')) {
+            return { encoding: 'base64', content: manifest('1.2.3-alpha.4') }
+          }
+          throw new Error(`unexpected url ${url}`)
+        },
+        npmHasVersion: () => true,
+        gitHasTag: () => false,
+      },
+    )
+    expect(result).toEqual({
+      action: 'skip',
+      tag: 'dsh-v1.2.3-alpha.4',
+      version: '1.2.3-alpha.4',
+      reason: '@prettier-ai/dsh@1.2.3-alpha.4 is already on the npm registry',
+    })
+  })
+
+  it('retries publish-only for the newest prerelease when the tracking tag exists', async () => {
+    const result = await probeUpstreamRelease(
+      { tag: '' },
+      {
+        fetchJson: async (url: string) => {
+          if (url.endsWith('/releases/latest')) throw new Error(`${url} failed: 404 Not Found`)
+          if (url.includes('/releases?per_page=1')) {
+            return [{ tag_name: 'dsh-v1.2.3-alpha.4', draft: false, prerelease: true }]
+          }
+          if (url.includes('/contents/apps/cli/package.json')) {
+            return { encoding: 'base64', content: manifest('1.2.3-alpha.4') }
+          }
+          throw new Error(`unexpected url ${url}`)
+        },
+        npmHasVersion: () => false,
+        gitHasTag: tag => tag === 'prettier-ai/1.2.3-alpha.4',
+      },
+    )
+    expect(result.action).toBe('publish-only')
+    expect(result.version).toBe('1.2.3-alpha.4')
+  })
+
+  it('falls back when /releases/latest answers a prerelease', async () => {
+    const result = await probeUpstreamRelease(
+      { tag: '' },
+      {
+        fetchJson: async (url: string) => {
+          if (url.endsWith('/releases/latest')) {
+            return { tag_name: 'dsh-v1.2.3-alpha.0', draft: false, prerelease: true }
+          }
+          if (url.includes('/releases?per_page=1')) {
+            return [{ tag_name: 'dsh-v1.2.3-alpha.0', draft: false, prerelease: true }]
+          }
+          if (url.includes('/contents/apps/cli/package.json')) {
+            return { encoding: 'base64', content: manifest('1.2.3-alpha.0') }
+          }
+          throw new Error(`unexpected url ${url}`)
+        },
+        npmHasVersion: () => false,
+        gitHasTag: () => false,
+      },
+    )
+    expect(result).toMatchObject({
+      action: 'sync',
+      tag: 'dsh-v1.2.3-alpha.0',
+      version: '1.2.3-alpha.0',
+    })
+  })
+
+  it('skips when the newest listed release is a draft', async () => {
+    const result = await probeUpstreamRelease(
+      { tag: '' },
+      {
+        fetchJson: async (url: string) => {
+          if (url.endsWith('/releases/latest')) throw new Error(`${url} failed: 404 Not Found`)
+          if (url.includes('/releases?per_page=1')) {
+            return [{ tag_name: 'dsh-v1.2.3', draft: true, prerelease: false }]
+          }
+          throw new Error(`unexpected url ${url}`)
+        },
+        npmHasVersion: () => false,
+        gitHasTag: () => false,
+      },
+    )
+    expect(result.action).toBe('skip')
+    expect(result.tag).toBe('')
   })
 
   it('accepts an operator tag that is not a GitHub Release', async () => {
@@ -117,9 +231,6 @@ describe('probeUpstreamRelease', () => {
   })
 
   it('accepts an operator prerelease tag when named explicitly', async () => {
-    const prereleaseManifest = Buffer.from(
-      JSON.stringify({ name: '@deepseek-ai/dsh', version: '1.2.3-alpha.4' }),
-    ).toString('base64')
     const result = await probeUpstreamRelease(
       { tag: 'dsh-v1.2.3-alpha.4' },
       {
@@ -128,7 +239,7 @@ describe('probeUpstreamRelease', () => {
             return { tag_name: 'dsh-v1.2.3-alpha.4', draft: false, prerelease: true }
           }
           if (url.includes('/contents/apps/cli/package.json')) {
-            return { encoding: 'base64', content: prereleaseManifest }
+            return { encoding: 'base64', content: manifest('1.2.3-alpha.4') }
           }
           throw new Error(`unexpected url ${url}`)
         },

@@ -10,10 +10,12 @@
  * fires every five minutes.
  *
  * Usage: `node scripts/probe-upstream-release.ts [--tag <upstream-tag>] [--github-output]`.
- * Without `--tag` the probe selects the latest non-prerelease GitHub Release;
- * prereleases are picked up only when an operator passes their tag explicitly.
- * While upstream has published no non-prerelease release at all,
- * `/releases/latest` answers 404 and the probe skips instead of failing.
+ * Without `--tag` the probe tries `GET /releases/latest` (non-prerelease). If
+ * that 404s or there is no non-prerelease latest, it falls back to the newest
+ * non-draft GitHub Release from `GET /releases?per_page=1` (includes
+ * prereleases). Drafts are skipped. When upstream has published no releases at
+ * all, the probe skips instead of failing. An operator `--tag` still names a
+ * specific tag, including prereleases.
  */
 
 import { spawnSync } from 'node:child_process'
@@ -24,13 +26,15 @@ import { parseArgs } from 'node:util'
 const UPSTREAM_REPO = 'deepseek-ai/deepseek-harness'
 const ENTRY_PACKAGE = '@prettier-ai/dsh'
 const DEFAULT_REGISTRY = 'https://registry.npmjs.org'
+const LATEST_RELEASE_URL = `https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest`
+const NEWEST_RELEASE_URL = `https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=1`
 
 /** What the workflow should do for one resolved upstream version. */
 export type ProbeAction = 'skip' | 'sync' | 'publish-only'
 
 /** Operator input for one probe. */
 export interface ProbeRequest {
-  /** Operator-supplied upstream tag; empty selects the latest non-prerelease release. */
+  /** Operator-supplied upstream tag; empty selects latest, then newest non-draft. */
   readonly tag: string
 }
 
@@ -85,7 +89,7 @@ export async function probeUpstreamRelease(request: ProbeRequest, deps: ProbeDep
       action: 'skip',
       tag: '',
       version: '',
-      reason: 'upstream has no non-prerelease GitHub Release yet; dispatch with an explicit tag to publish a prerelease',
+      reason: 'upstream has no GitHub Release yet',
     }
   }
   const version = await readUpstreamVersion(release.tag, deps)
@@ -115,9 +119,15 @@ export async function probeUpstreamRelease(request: ProbeRequest, deps: ProbeDep
 }
 
 async function readLatestRelease(deps: ProbeDependencies): Promise<{ tag: string } | null> {
+  const stable = await readStableLatestRelease(deps)
+  if (stable !== null) return stable
+  return await readNewestNonDraftRelease(deps)
+}
+
+async function readStableLatestRelease(deps: ProbeDependencies): Promise<{ tag: string } | null> {
   let payload: unknown
   try {
-    payload = await deps.fetchJson(`https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest`)
+    payload = await deps.fetchJson(LATEST_RELEASE_URL)
   } catch (error) {
     // 404 means upstream has never published a non-prerelease release.
     const message = error instanceof Error ? error.message : String(error)
@@ -125,9 +135,26 @@ async function readLatestRelease(deps: ProbeDependencies): Promise<{ tag: string
     throw error
   }
   const release = asRelease(payload, `GET /repos/${UPSTREAM_REPO}/releases/latest`)
-  if (release.draft === true || release.prerelease === true) {
-    throw new Error(`upstream latest release ${release.tag} is draft or prerelease; GitHub should not return those from /releases/latest`)
+  if (release.draft === true || release.prerelease === true) return null
+  return { tag: release.tag }
+}
+
+async function readNewestNonDraftRelease(deps: ProbeDependencies): Promise<{ tag: string } | null> {
+  let payload: unknown
+  try {
+    payload = await deps.fetchJson(NEWEST_RELEASE_URL)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('404')) return null
+    throw error
   }
+  if (!Array.isArray(payload)) {
+    throw new Error(`GET /repos/${UPSTREAM_REPO}/releases?per_page=1 did not return an array`)
+  }
+  const first = payload[0]
+  if (first === undefined) return null
+  const release = asRelease(first, `GET /repos/${UPSTREAM_REPO}/releases?per_page=1`)
+  if (release.draft === true) return null
   return { tag: release.tag }
 }
 

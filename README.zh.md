@@ -22,7 +22,7 @@
 
 轻量的 `decide` 作业仅稀疏检出 `scripts/probe-upstream-release.ts`，用 Node 24 的类型剥离直接运行——不安装任何依赖。探测流程：
 
-1. 解析上游 tag：`GET /repos/deepseek-ai/deepseek-harness/releases/latest`，或手动触发时操作者提供的 tag。`/releases/latest` 从不返回草稿或预发布版本。
+1. 解析上游 tag。未指定操作者 tag 时，先请求 `GET /repos/deepseek-ai/deepseek-harness/releases/latest`。若该接口 404 或没有非预发布的 latest，则回退到 `GET /releases?per_page=1` 中最新的非草稿 GitHub Release（包含预发布）。草稿会被跳过。手动 `--tag` 仍可直接指定某个 tag（含预发布）。上游尚无任何 Release 时探测会安静跳过。
 2. 读取该 tag 下的 `apps/cli/package.json` 获取 npm 版本号（文件不可用时回退为 tag 后缀）。
 3. 得出三种决策之一：
    - `skip` —— `@prettier-ai/dsh@<version>` 已存在于 npm registry，重活作业不运行。
@@ -46,7 +46,7 @@
 
 ### 手动触发
 
-在 Actions 页（或用 `gh workflow run`）运行 `Sync upstream release` workflow。可选的 `tag` 输入直接指定上游 git tag。预发布版本必须走这条路：`/releases/latest` 会跳过它们，只有操作者显式传入 tag 时才会发布 alpha 或 beta。
+在 Actions 页（或用 `gh workflow run`）运行 `Sync upstream release` workflow。可选的 `tag` 输入直接指定上游 git tag。留空时与定时任务相同：先取非预发布 latest，否则取最新的非草稿 Release（含预发布）。
 
 ### 跟踪引用
 
