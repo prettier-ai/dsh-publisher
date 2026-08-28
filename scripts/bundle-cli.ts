@@ -216,8 +216,7 @@ export function packBundledDirectory(packageDir: string, outDir: string): Packed
     throw new Error(`bundle-cli: packed identity ${packed.name}@${packed.version}, expected ${CLI_PACKAGE_NAME}@${version}`)
   }
   assertBundledCliManifest(readPackedManifest(file))
-  const listing = tarballListing(file)
-  if (!listing.some(line => line.startsWith('package/node_modules/'))) {
+  if (!tarballHasPathPrefix(file, 'package/node_modules/')) {
     throw new Error('bundle-cli: packed tarball is missing package/node_modules/')
   }
   return { name: packed.name, version: packed.version, file }
@@ -358,8 +357,27 @@ function readPackedIdentity(tarball: string): { name: string; version: string } 
   return { name, version }
 }
 
-function tarballListing(tarball: string): string[] {
-  return execFileSync('tar', ['-tzf', tarball], { encoding: 'utf8' }).split('\n').filter(line => line !== '')
+/**
+ * Whether a packed tarball lists a member whose path contains `prefix`.
+ * Streams `tar -tzf` through grep so a bundled CLI `node_modules` listing
+ * cannot hit Node's 1 MiB spawnSync maxBuffer (`ENOBUFS`).
+ * @param tarball - path to a `.tgz`.
+ * @param prefix - path prefix, for example `package/node_modules/`.
+ */
+export function tarballHasPathPrefix(tarball: string, prefix: string): boolean {
+  const result = spawnSync(
+    'sh',
+    ['-c', 'tar -tzf "$1" | grep -F -m1 -- "$2" >/dev/null', 'tarball-has-prefix', tarball, prefix],
+    { encoding: 'utf8' },
+  )
+  if (result.status === 0) return true
+  if (result.status === 1) return false
+  const detail = result.stderr !== undefined && result.stderr !== ''
+    ? result.stderr
+    : result.error instanceof Error
+      ? result.error.message
+      : `status ${String(result.status)}`
+  throw new Error(`bundle-cli: tar -tzf failed: ${detail}`)
 }
 
 function main(): void {
