@@ -95,14 +95,16 @@ describe('Pack CLI / Publish CLI workflow', () => {
     expect(yaml).not.toMatch(/^\s+- cron:/m)
     expect(yaml).not.toMatch(/^\s+pnpm run release:pack --family/m)
     expect(yaml).not.toMatch(/^\s+pnpm run release:publish --family/m)
-    expect(yaml).toContain('pnpm --dir apps/cli pack')
-    expect(yaml).toContain('inject-deepseek-ai-compat.ts --apply --from dist/npm-cli')
+    expect(yaml).toContain('bundle-cli.ts --workspace . --out dist/npm-cli')
+    expect(yaml).toContain('inject-deepseek-ai-compat.ts --check --applied --from dist/npm-cli')
     expect(yaml).toContain('publish-cli-tarball.ts --from dist/npm-cli')
   })
 
   it('does not rewrite the publish overlay scripts themselves', () => {
     expect(OVERLAY_SCRIPT_FILES).toContain('scripts/publish-cli-tarball.ts')
     expect(OVERLAY_SCRIPT_FILES).toContain('scripts/publish-cli-tarball.spec.ts')
+    expect(OVERLAY_SCRIPT_FILES).toContain('scripts/bundle-cli.ts')
+    expect(OVERLAY_SCRIPT_FILES).toContain('scripts/bundle-cli.spec.ts')
     expect(shouldRewritePath('scripts/publish-cli-tarball.ts')).toBe(false)
     expect(shouldRewritePath('scripts/publish-cli-tarball.spec.ts')).toBe(false)
   })

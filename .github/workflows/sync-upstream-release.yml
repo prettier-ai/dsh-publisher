@@ -126,6 +126,8 @@ jobs:
              scripts/publish-cli-tarball.spec.ts \
              scripts/publish-dshp.ts \
              scripts/publish-dshp.spec.ts \
+             scripts/bundle-cli.ts \
+             scripts/bundle-cli.spec.ts \
              upstream/scripts/
 
       - uses: actions/setup-node@v6
@@ -160,14 +162,30 @@ jobs:
           pnpm run release:pack --family vendor --out dist/npm-vendor
           pnpm run release:pack --family dsh --out dist/npm
 
-      # After pack, rewrite the packed CLI tarball: npm aliases plus a Node
-      # module hook on the bin. Do not add @deepseek-ai/* deps before pnpm
-      # install — that would make CI fetch those names from the registry.
+      # After pack, rewrite packed app tarballs: npm aliases plus a Node module
+      # hook on the bin. Do not add @deepseek-ai/* deps before pnpm install —
+      # that would make CI fetch those names from the registry.
       - name: Inject @deepseek-ai/* compatibility into packed app tarballs
         working-directory: upstream
         run: |
           set -euo pipefail
           node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --apply --from dist/npm
+          node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --check --applied --from dist/npm
+
+      # Replace the thin CLI member with a lockfile-bundled tarball so npm
+      # install of @prettier-ai/dsh does not resolve the workspace peer graph.
+      # bundle-cli also applies the runtime loader and omits install-time
+      # aliases (those would re-list @prettier-ai/* on dependencies).
+      - name: Replace the CLI tarball with a lockfile-bundled package
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/bundle-cli.ts --workspace . --out dist/npm --replace
+
+      - name: Verify the bundled CLI still carries the runtime hook
+        working-directory: upstream
+        run: |
+          set -euo pipefail
           node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --check --applied --from dist/npm
 
       # Thin @prettier-ai/dshp wrapper. Packed from this repository, never from
