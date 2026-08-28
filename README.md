@@ -1,2 +1,67 @@
 # dsh-publisher
-Publishes official DeepSeek Harness releases to the @prettier-ai npm scope.
+
+English | [中文](./README.zh.md)
+
+Standalone publisher that republishes official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) releases onto the [`@prettier-ai`](https://www.npmjs.com/org/prettier-ai) npm scope. The entry package is `@prettier-ai/dsh`; every workspace package it depends on is published as `@prettier-ai/*`. Versions mirror the official release exactly.
+
+## What this repository is
+
+- A poller: a scheduled workflow reads the official repository's latest GitHub Release and decides whether that version still needs a `@prettier-ai` publication.
+- A republisher: when a version is missing, the workflow fetches the official tag into the runner workspace, rewrites the packable package names from `@deepseek-ai/*` to `@prettier-ai/*` (a pack-only rewrite — no product renaming), then packs and publishes from that checkout.
+- Two scripts plus their unit tests: `scripts/probe-upstream-release.ts` (the decision) and `scripts/rescope-to-prettier-ai.ts` (the rewrite).
+
+## What this repository is not
+
+- Not a fork or mirror of the Harness source tree. No Harness sources are committed here, and the sync workflow never pushes rescoped sources back. A `git clone` of this repository stays small.
+- Not a place where Harness development happens. Bugs in the Harness itself belong upstream.
+- Not a rebranding. Published tarballs keep the upstream `DeepSeek Harness` product naming, documentation, and MIT license text (including the DeepSeek copyright); only npm package names change scope.
+
+## How polling works
+
+`.github/workflows/sync-upstream-release.yml` runs on a `*/5 * * * *` (UTC) schedule and on manual dispatch. GitHub cron is best-effort: runs may drift by minutes or be dropped under load; the next run catches up.
+
+The cheap `decide` job sparse-checkouts only `scripts/probe-upstream-release.ts` and runs it with Node 24 type stripping — no package installation. The probe:
+
+1. Resolves the upstream tag: `GET /repos/deepseek-ai/deepseek-harness/releases/latest`, or the operator-supplied tag on dispatch. `/releases/latest` never returns drafts or prereleases.
+2. Reads `apps/cli/package.json` at that tag to learn the npm version (falling back to the tag suffix if the file is unavailable).
+3. Decides one of:
+   - `skip` — `@prettier-ai/dsh@<version>` already exists on the npm registry. The heavy job does not run.
+   - `publish-only` — this repository's tracking tag `prettier-ai/<version>` exists but npm lacks the version (for example a previous run packed but could not publish). The heavy job runs again end to end; publishing is idempotent per package.
+   - `sync` — the version is new. The heavy job runs and pushes the tracking tag afterwards.
+
+The heavy `sync` job fetches the official tag (shallow clone), copies the overlay scripts onto that checkout, runs `--apply` and `--check --applied` there, installs the rescoped workspace, builds, packs the `vendor` family then the `dsh` family, uploads the tarballs as workflow artifacts, and publishes.
+
+## What gets published
+
+- `@prettier-ai/dsh` — the CLI, with the upstream `dsh` bin.
+- `@prettier-ai/*` — the workspace packages of the official release (core, vendor, and landlock families), each at the upstream version.
+
+The rescope rewrites package manifests, shipped source specifiers, the lockfile, release scripts, and pack-related CI. It deliberately leaves Markdown prose, GitHub URLs, product titles, `description` fields, and the upstream `LICENSE` untouched, so tarballs ship the original MIT text with the DeepSeek copyright.
+
+## Operating
+
+### Required secret
+
+`NPM_TOKEN` — an npm token with publish access to the `prettier-ai` org. Add it under Settings → Secrets and variables → Actions. Without it the workflow still rescopes, packs, and uploads tarball artifacts, then skips `npm publish` with a clear log line.
+
+### Manual dispatch
+
+Run the `Sync upstream release` workflow from the Actions tab (or `gh workflow run`). The optional `tag` input names an upstream git tag directly. This is required for prereleases: `/releases/latest` skips them, so an alpha or beta is published only when an operator passes its tag explicitly.
+
+### Tracking refs
+
+A successful `sync` run pushes a lightweight tag `prettier-ai/<version>` to this repository. The tag marks the version as processed so scheduled runs return to the cheap skip path; it points at this repository's commit, never at upstream sources.
+
+## Development
+
+```sh
+pnpm install
+pnpm run typecheck
+pnpm test
+```
+
+Unit tests are network-free: the probe's GitHub, npm, and git readers are injected, and the rescope tests operate on temporary fixture trees.
+
+## License
+
+This repository's own files are MIT-licensed (© 2026 prettier-ai / aaravarr); see [LICENSE](./LICENSE). Published tarballs are built from the official DeepSeek Harness tree and retain its MIT license and DeepSeek copyright.

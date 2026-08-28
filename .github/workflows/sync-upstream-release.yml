@@ -1,0 +1,182 @@
+# Poll official DeepSeek Harness releases and republish the same version under
+# the @prettier-ai npm scope. This repository is a standalone publisher and
+# never vendors the Harness source tree: the sync job fetches the official tag
+# into the runner workspace, copies the overlay scripts onto that checkout,
+# applies the pack-only rescope there, then packs and publishes from there.
+#
+# GitHub Actions cannot subscribe to another repository's releases, so this
+# workflow polls GET /repos/deepseek-ai/deepseek-harness/releases/latest every
+# five minutes and accepts a manual tag. GitHub cron is best-effort and may
+# drift or drop runs. /releases/latest never returns prereleases; an operator
+# must dispatch this workflow with an explicit tag to publish one.
+#
+# Required secret: NPM_TOKEN — an npm token with publish access to the
+# prettier-ai org (Settings -> Secrets and variables -> Actions). When it is
+# missing the job still rescopes, packs, and uploads tarball artifacts, then
+# skips `npm publish` with a clear log line. Never commit a token.
+#
+# Tracking ref: a lightweight tag prettier-ai/<npm-version> on this repository
+# records that a version has been processed. No rescoped source files are ever
+# pushed to this repository.
+name: Sync upstream release
+
+on:
+  schedule:
+    # GitHub's documented floor is 5 minutes. Cron is best-effort and may drift.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream git tag (empty = latest non-prerelease GitHub Release)'
+        required: false
+        type: string
+
+permissions:
+  # contents: write pushes the prettier-ai/<version> tracking tag.
+  contents: write
+  # id-token: write lets npm attach provenance when the release scripts request it.
+  id-token: write
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+  UPSTREAM_REMOTE: https://github.com/deepseek-ai/deepseek-harness.git
+
+jobs:
+  decide:
+    name: Probe official release
+    # Sparse-checkout + Node 24 type stripping only. The skip path runs every
+    # five minutes and must stay under about a minute; it never installs.
+    runs-on: ubuntu-24.04
+    outputs:
+      action: ${{ steps.probe.outputs.action }}
+      tag: ${{ steps.probe.outputs.tag }}
+      version: ${{ steps.probe.outputs.version }}
+      reason: ${{ steps.probe.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/probe-upstream-release.ts
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Probe
+        id: probe
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ -n "${INPUT_TAG}" ]]; then
+            extra+=(--tag "${INPUT_TAG}")
+          fi
+          node scripts/probe-upstream-release.ts --github-output "${extra[@]}"
+
+  sync:
+    name: Rescope, pack, publish
+    needs: decide
+    if: needs.decide.outputs.action != 'skip'
+    runs-on: ubuntu-24.04
+    env:
+      ACTION: ${{ needs.decide.outputs.action }}
+      UPSTREAM_TAG: ${{ needs.decide.outputs.tag }}
+      VERSION: ${{ needs.decide.outputs.version }}
+      DECISION: ${{ needs.decide.outputs.reason }}
+    steps:
+      # This repository: overlay scripts plus credentials for the tag push.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+
+      - name: Fetch the official tag
+        run: |
+          set -euo pipefail
+          echo "probe decision: ${DECISION}"
+          git clone --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REMOTE}" upstream
+
+      - name: Copy the overlay scripts onto the official checkout
+        run: |
+          set -euo pipefail
+          cp scripts/rescope-to-prettier-ai.ts \
+             scripts/rescope-to-prettier-ai.spec.ts \
+             scripts/probe-upstream-release.ts \
+             scripts/probe-upstream-release.spec.ts \
+             upstream/scripts/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Apply the rescope to the official checkout
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          node scripts/rescope-to-prettier-ai.ts --apply
+          node scripts/rescope-to-prettier-ai.ts --check --applied
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: upstream/package.json
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - name: Install the rescoped workspace
+        working-directory: upstream
+        run: pnpm install --ignore-scripts
+
+      - name: Build official artifacts
+        working-directory: upstream
+        run: pnpm run build:official
+
+      - name: Pack vendor then dsh
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          pnpm run release:pack --family vendor --out dist/npm-vendor
+          pnpm run release:pack --family dsh --out dist/npm
+
+      # Artifacts are uploaded before publish so a missing token or a failed
+      # publish still leaves the packed tarballs on the workflow run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prettier-ai-npm-tarballs-${{ needs.decide.outputs.version }}
+          path: |
+            upstream/dist/npm/*
+            upstream/dist/npm-vendor/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish to npm when NPM_TOKEN is present
+        working-directory: upstream
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NPM_TOKEN}" ]]; then
+            echo "NPM_TOKEN is unset: packed tarballs were uploaded as workflow artifacts; skipping npm publish."
+            echo "Add a repository secret NPM_TOKEN with publish access to the prettier-ai npm org, then re-run this workflow (the probe answers publish-only once the tracking tag exists)."
+            exit 0
+          fi
+          export NODE_AUTH_TOKEN="${NPM_TOKEN}"
+          pnpm run release:publish --family vendor --from dist/npm-vendor
+          pnpm run release:publish --family dsh --from dist/npm
+
+      # The tag marks the version as processed so scheduled runs go back to the
+      # cheap skip path. It points at this repository's HEAD, never at upstream
+      # sources. publish-only runs already have the tag.
+      - name: Push the tracking tag
+        if: env.ACTION == 'sync'
+        run: |
+          set -euo pipefail
+          git tag "prettier-ai/${VERSION}"
+          git push origin "refs/tags/prettier-ai/${VERSION}"
