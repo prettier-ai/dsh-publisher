@@ -5,17 +5,27 @@
  * repository's tracking tag already records the version.
  *
  * The scheduled decide job sparse-checkouts only this file and runs it with
- * Node 24 type stripping (`node scripts/probe-upstream-release.ts`); it does
- * not install anything. The skip path must stay fast because the schedule
- * fires every five minutes.
+ * Node 24 type stripping (`node --experimental-strip-types
+ * scripts/probe-upstream-release.ts`); it does not install anything. The skip
+ * path must stay fast because the schedule fires every five minutes.
  *
- * Usage: `node scripts/probe-upstream-release.ts [--tag <upstream-tag>] [--github-output]`.
+ * Usage: `node --experimental-strip-types scripts/probe-upstream-release.ts [--tag <upstream-tag>] [--github-output]`.
  * Without `--tag` the probe tries `GET /releases/latest` (non-prerelease). If
  * that 404s or there is no non-prerelease latest, it falls back to the newest
  * non-draft GitHub Release from `GET /releases?per_page=1` (includes
  * prereleases). Drafts are skipped. When upstream has published no releases at
  * all, the probe skips instead of failing. An operator `--tag` still names a
  * specific tag, including prereleases.
+ *
+ * First-publish probes must treat an unpublished `@prettier-ai/dsh` and a
+ * missing `prettier-ai/<version>` tracking tag as absent (return false), not
+ * as a crash. Registry existence is `GET
+ * https://registry.npmjs.org/@prettier-ai%2fdsh/<version>`: HTTP 404 means
+ * missing. That avoids `npm view` CLI error-string matching. `git ls-remote
+ * --exit-code` statuses 1 and 2 mean the tag is absent. Git HTTPS does not
+ * accept a Bearer extraheader; a token is sent as Basic `x-access-token` (the
+ * same form actions/checkout uses). If that auth still fails, the probe retries
+ * without credentials so a public repository can answer "tag missing".
  */
 
 import { spawnSync } from 'node:child_process'
@@ -41,7 +51,7 @@ export interface ProbeRequest {
 /** Collaborators the probe uses to read GitHub, npm, and this repository's tags. */
 export interface ProbeDependencies {
   readonly fetchJson: (url: string) => Promise<unknown>
-  readonly npmHasVersion: (name: string, version: string) => boolean
+  readonly npmHasVersion: (name: string, version: string) => boolean | Promise<boolean>
   readonly gitHasTag: (tag: string) => boolean
 }
 
@@ -64,6 +74,12 @@ interface GithubContent {
   readonly content?: unknown
 }
 
+interface GitLsRemoteResult {
+  readonly status: number | null
+  readonly stdout: string
+  readonly stderr: string
+}
+
 /**
  * Strip a `dsh-v` / `v` tag prefix to recover the npm version the release tagged.
  * @param tag - upstream git tag name.
@@ -72,6 +88,57 @@ interface GithubContent {
 export function versionFromUpstreamTag(tag: string): string {
   const prefixed = /^(?:dsh-)?v(.+)$/.exec(tag)
   return prefixed?.[1] ?? tag
+}
+
+/**
+ * True when an HTTP/GitHub error means the resource is missing.
+ * @param error - thrown value from `fetchJson` or a similar helper.
+ * @returns True for 404 / Not Found, including `failed: 404 Not Found`.
+ */
+export function isHttpNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('404') || /not found/i.test(message)
+}
+
+/**
+ * Registry URL for one exact package version (scoped names use `%2f`).
+ * @param name - package name, for example `@prettier-ai/dsh`.
+ * @param version - exact version.
+ * @param registry - npm registry origin.
+ * @returns `https://registry.npmjs.org/@prettier-ai%2fdsh/<version>`.
+ */
+export function registryVersionUrl(name: string, version: string, registry = DEFAULT_REGISTRY): string {
+  const base = registry.endsWith('/') ? registry.slice(0, -1) : registry
+  return `${base}/${name.replaceAll('/', '%2f')}/${encodeURIComponent(version)}`
+}
+
+/**
+ * True when `git ls-remote --exit-code` means the named ref is absent.
+ * Git uses 2 when `--exit-code` finds no matches; some versions use 1.
+ * @param status - process exit status, or null when the process was signaled.
+ * @returns True when the remote did not advertise the ref.
+ */
+export function gitLsRemoteIndicatesMissing(status: number | null): boolean {
+  return status === 1 || status === 2
+}
+
+/**
+ * True when `git ls-remote` failed because GitHub rejected credentials or
+ * could not prompt for them (typical of a Bearer extraheader on git HTTPS).
+ * @param status - process exit status.
+ * @param output - combined stdout and stderr.
+ * @returns True when a retry without credentials may still work on a public remote.
+ */
+export function gitAuthFailed(status: number | null, output: string): boolean {
+  if (status === 0 || gitLsRemoteIndicatesMissing(status)) return false
+  const text = output.toLowerCase()
+  return (
+    text.includes('could not read username') ||
+    text.includes('could not read password') ||
+    text.includes('authentication failed') ||
+    text.includes('invalid credentials') ||
+    text.includes('terminal prompts disabled')
+  )
 }
 
 /**
@@ -93,7 +160,7 @@ export async function probeUpstreamRelease(request: ProbeRequest, deps: ProbeDep
     }
   }
   const version = await readUpstreamVersion(release.tag, deps)
-  if (deps.npmHasVersion(ENTRY_PACKAGE, version)) {
+  if (await deps.npmHasVersion(ENTRY_PACKAGE, version)) {
     return {
       action: 'skip',
       tag: release.tag,
@@ -130,8 +197,7 @@ async function readStableLatestRelease(deps: ProbeDependencies): Promise<{ tag: 
     payload = await deps.fetchJson(LATEST_RELEASE_URL)
   } catch (error) {
     // 404 means upstream has never published a non-prerelease release.
-    const message = error instanceof Error ? error.message : String(error)
-    if (message.includes('404')) return null
+    if (isHttpNotFound(error)) return null
     throw error
   }
   const release = asRelease(payload, `GET /repos/${UPSTREAM_REPO}/releases/latest`)
@@ -144,8 +210,7 @@ async function readNewestNonDraftRelease(deps: ProbeDependencies): Promise<{ tag
   try {
     payload = await deps.fetchJson(NEWEST_RELEASE_URL)
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (message.includes('404')) return null
+    if (isHttpNotFound(error)) return null
     throw error
   }
   if (!Array.isArray(payload)) {
@@ -166,8 +231,7 @@ async function readNamedRelease(tag: string, deps: ProbeDependencies): Promise<{
     const release = asRelease(payload, `GET /repos/${UPSTREAM_REPO}/releases/tags/${tag}`)
     return { tag: release.tag }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (!message.includes('404')) throw error
+    if (!isHttpNotFound(error)) throw error
     return { tag }
   }
 }
@@ -189,8 +253,7 @@ async function readUpstreamVersion(tag: string, deps: ProbeDependencies): Promis
     }
     return version
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (message.includes('404')) return fallback
+    if (isHttpNotFound(error)) return fallback
     throw error
   }
 }
@@ -218,22 +281,31 @@ function asContent(payload: unknown): string {
 }
 
 /**
- * `npm view` whether a version exists on the configured registry.
+ * Whether a version exists on the registry. Uses `GET /<name>/<version>`
+ * (HTTP 404 = unpublished / missing) instead of `npm view`, so the cheap probe
+ * does not depend on npm CLI error strings.
  * @param name - package name.
  * @param version - exact version.
  * @param registry - npm registry URL.
- * @returns True when the registry has that version.
+ * @param fetchImpl - `fetch` (injected in tests).
+ * @returns True when the registry has that version; false when it is unpublished.
  */
-export function npmHasVersion(name: string, version: string, registry = DEFAULT_REGISTRY): boolean {
-  const result = spawnSync(
-    'npm',
-    ['view', `${name}@${version}`, 'version', '--registry', registry, '--json'],
-    { encoding: 'utf8' },
-  )
-  if (result.status === 0) return true
-  const output = `${result.stdout}${result.stderr}`
-  if (output.includes('E404') || output.includes('404 Not Found')) return false
-  throw new Error(`npm view ${name}@${version} failed:\n${output}`)
+export async function npmHasVersion(
+  name: string,
+  version: string,
+  registry = DEFAULT_REGISTRY,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  const url = registryVersionUrl(name, version, registry)
+  const response = await fetchImpl(url, {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'prettier-ai-dsh-publisher',
+    },
+  })
+  if (response.status === 404) return false
+  if (response.ok) return true
+  throw new Error(`${url} failed: ${String(response.status)} ${response.statusText}`)
 }
 
 /**
@@ -241,18 +313,44 @@ export function npmHasVersion(name: string, version: string, registry = DEFAULT_
  * @param tag - `prettier-ai/<version>`.
  * @param remote - publisher git URL (never embed a token in this URL).
  * @param token - optional GitHub token sent as an HTTP extraheader.
- * @returns True when the remote advertises that tag.
+ * @returns True when the remote advertises that tag; false when it is absent.
  */
 export function gitHasTag(tag: string, remote: string, token = ''): boolean {
-  const extra = token === '' ? [] : ['-c', `http.extraheader=AUTHORIZATION: bearer ${token}`]
+  const first = runGitLsRemote(remote, tag, token)
+  const firstOutput = `${first.stdout}${first.stderr}`
+  if (first.status === 0) return true
+  if (gitLsRemoteIndicatesMissing(first.status)) return false
+  if (token !== '' && gitAuthFailed(first.status, firstOutput)) {
+    const retry = runGitLsRemote(remote, tag, '')
+    if (retry.status === 0) return true
+    if (gitLsRemoteIndicatesMissing(retry.status)) return false
+    throw new Error(`git ls-remote ${remote} ${tag} failed:\n${retry.stdout}${retry.stderr}`)
+  }
+  throw new Error(`git ls-remote ${remote} ${tag} failed:\n${firstOutput}`)
+}
+
+function gitCredentialArgs(token: string): string[] {
+  if (token === '') return []
+  // Git HTTPS on github.com expects HTTP Basic, not a REST Bearer token.
+  // Bearer extraheaders make git prompt for a username and exit 128 in CI.
+  const basic = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64')
+  return ['-c', `http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}`]
+}
+
+function runGitLsRemote(remote: string, tag: string, token: string): GitLsRemoteResult {
   const result = spawnSync(
     'git',
-    [...extra, 'ls-remote', '--exit-code', remote, `refs/tags/${tag}`],
-    { encoding: 'utf8' },
+    [...gitCredentialArgs(token), 'ls-remote', '--exit-code', remote, `refs/tags/${tag}`],
+    {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    },
   )
-  if (result.status === 0) return true
-  if (result.status === 2 || result.status === 1) return false
-  throw new Error(`git ls-remote ${remote} ${tag} failed:\n${result.stdout}${result.stderr}`)
+  return {
+    status: result.status,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+  }
 }
 
 function githubHeaders(): Record<string, string> {
@@ -314,5 +412,8 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  void main()
+  void main().catch((error: unknown) => {
+    console.error(error)
+    process.exit(1)
+  })
 }
