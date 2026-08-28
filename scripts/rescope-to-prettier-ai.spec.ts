@@ -30,6 +30,10 @@ describe('shouldRewritePath', () => {
     expect(shouldRewritePath('scripts/inject-deepseek-ai-compat.spec.ts')).toBe(false)
     expect(shouldRewritePath('scripts/publish-cli-tarball.ts')).toBe(false)
     expect(shouldRewritePath('scripts/publish-cli-tarball.spec.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/publish-dshp.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/publish-dshp.spec.ts')).toBe(false)
+    expect(shouldRewritePath('packages/dshp/package.json')).toBe(false)
+    expect(shouldRewritePath('packages/dshp/bin.js')).toBe(false)
   })
 
   it('rewrites manifests, shipped sources, release scripts, the lockfile, and pack workflows', () => {
@@ -221,5 +225,17 @@ describe('rescopeTree', () => {
     execFileSync('git', ['init'], { cwd: dir })
     execFileSync('git', ['add', '--', 'apps/cli/package.json'], { cwd: dir })
     expect(() => checkAppliedRescope(dir)).toThrow(/apps\/cli package name/)
+  })
+
+  it('rejects checkAppliedRescope when the CLI package declares a dshp bin', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rescope-to-prettier-ai-dshp-'))
+    mkdirSync(join(dir, 'apps/cli'), { recursive: true })
+    writeFileSync(join(dir, 'apps/cli/package.json'), JSON.stringify({
+      name: '@prettier-ai/dsh',
+      bin: { dsh: 'lib/bin.js', dshp: 'lib/bin.js' },
+    }))
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['add', '--', 'apps/cli/package.json'], { cwd: dir })
+    expect(() => checkAppliedRescope(dir)).toThrow(/must not declare bin\.dshp/)
   })
 })

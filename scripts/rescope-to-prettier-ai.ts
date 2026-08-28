@@ -47,11 +47,14 @@ export const OVERLAY_SCRIPT_FILES: readonly string[] = [
   'scripts/inject-deepseek-ai-compat.spec.ts',
   'scripts/publish-cli-tarball.ts',
   'scripts/publish-cli-tarball.spec.ts',
+  'scripts/publish-dshp.ts',
+  'scripts/publish-dshp.spec.ts',
 ]
 
 /** Paths the rewrite must not touch: frozen upstream history and this overlay. */
 export const RESCOPE_SKIP_PREFIXES: readonly string[] = [
   '.agents/notes/archived/',
+  'packages/dshp/',
   ...OVERLAY_SCRIPT_FILES,
 ]
 
@@ -262,6 +265,9 @@ export function checkAppliedRescope(repositoryRoot: string): void {
   if (cli.bin?.dsh !== 'lib/bin.js') {
     failures.push(`postcondition: apps/cli bin.dsh is ${JSON.stringify(cli.bin?.dsh)}, expected "lib/bin.js"`)
   }
+  if (cli.bin !== undefined && 'dshp' in cli.bin) {
+    failures.push('postcondition: apps/cli must not declare bin.dshp; @prettier-ai/dshp is a separate package')
+  }
   failures.push(...checkFamilyPackageNames(repositoryRoot, 'dsh', DSH_FAMILY_PATTERNS))
   failures.push(...checkFamilyPackageNames(repositoryRoot, 'vendor', VENDOR_FAMILY_PATTERNS))
   failures.push(...checkFamilyPackageNames(repositoryRoot, 'landlock', LANDLOCK_FAMILY_PATTERNS))
@@ -272,7 +278,7 @@ export function checkAppliedRescope(repositoryRoot: string): void {
 
 interface CliManifest {
   name?: string
-  bin?: { dsh?: string }
+  bin?: { dsh?: string; dshp?: unknown }
 }
 
 function readCliManifest(repositoryRoot: string): CliManifest {
