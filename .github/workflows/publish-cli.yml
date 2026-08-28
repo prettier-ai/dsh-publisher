@@ -116,21 +116,13 @@ jobs:
           echo "probe decision: ${DECISION}"
           git clone --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REMOTE}" upstream
 
-      - name: Copy the overlay scripts onto the official checkout
+      - name: Copy the rescope overlay onto the official checkout
         run: |
           set -euo pipefail
+          # Official tsconfig.host.json typechecks scripts/**/*.ts. Copy only
+          # the rescope entry before build:official. Overlay files that keep
+          # @deepseek-ai/ as data land after that typecheck.
           cp scripts/rescope-to-prettier-ai.ts \
-             scripts/rescope-to-prettier-ai.spec.ts \
-             scripts/probe-upstream-release.ts \
-             scripts/probe-upstream-release.spec.ts \
-             scripts/inject-deepseek-ai-compat.ts \
-             scripts/inject-deepseek-ai-compat.spec.ts \
-             scripts/publish-cli-tarball.ts \
-             scripts/publish-cli-tarball.spec.ts \
-             scripts/publish-dshp.ts \
-             scripts/publish-dshp.spec.ts \
-             scripts/bundle-cli.ts \
-             scripts/bundle-cli.spec.ts \
              upstream/scripts/
 
       - uses: actions/setup-node@v6
@@ -157,6 +149,22 @@ jobs:
       - name: Build official artifacts
         working-directory: upstream
         run: pnpm run build:official
+
+      - name: Copy the remaining overlay scripts onto the official checkout
+        run: |
+          set -euo pipefail
+          cp scripts/rescope-to-prettier-ai.spec.ts \
+             scripts/probe-upstream-release.ts \
+             scripts/probe-upstream-release.spec.ts \
+             scripts/inject-deepseek-ai-compat.ts \
+             scripts/inject-deepseek-ai-compat.spec.ts \
+             scripts/publish-cli-tarball.ts \
+             scripts/publish-cli-tarball.spec.ts \
+             scripts/publish-dshp.ts \
+             scripts/publish-dshp.spec.ts \
+             scripts/bundle-cli.ts \
+             scripts/bundle-cli.spec.ts \
+             upstream/scripts/
 
       - name: Bundle @prettier-ai/dsh from the resolved lockfile
         working-directory: upstream

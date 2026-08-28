@@ -3,15 +3,17 @@
  * prefix from `@deepseek-ai/` to `@prettier-ai/`.
  *
  * This repository never vendors the Harness tree. The sync workflow fetches an
- * official tag into the runner workspace, copies this script (and its sibling
- * overlay files) onto that checkout, and runs `--apply` there before packing
- * and publishing. The mapping replaces the delimited npm scope `@deepseek-ai/`
- * (and the regex-escaped form `@deepseek-ai\\/`) in publishable manifests,
- * shipped source specifiers, tests/gates that would otherwise break, release
- * scripts, the lockfile, and pack-related workflows. It does not restyle
- * Markdown prose, GitHub URLs, catalog slugs, product titles, or package.json
- * `description` fields, and it does not touch the upstream LICENSE, so the
- * DeepSeek copyright ships unchanged inside the published tarballs.
+ * official tag into the runner workspace, copies this script onto that checkout,
+ * and runs `--apply` there before packing and publishing. Overlay scripts that
+ * keep `@deepseek-ai/` as data (compat, pack, publish) are copied only after
+ * official `build:official`, because that profile typechecks TypeScript under scripts/.
+ * The mapping replaces the delimited npm scope `@deepseek-ai/` (and the
+ * regex-escaped form `@deepseek-ai\\/`) in publishable manifests, shipped source
+ * specifiers, tests/gates that would otherwise break, release scripts, the
+ * lockfile, and pack-related workflows. It does not restyle Markdown prose,
+ * GitHub URLs, catalog slugs, product titles, or package.json `description`
+ * fields, and it does not touch the upstream LICENSE, so the DeepSeek copyright
+ * ships unchanged inside the published tarballs.
  *
  * Usage: `node scripts/rescope-to-prettier-ai.ts [--apply|--check|--check --applied]`
  * (Node 24 type stripping; no install required). Without a mode it reports
@@ -34,12 +36,21 @@ const FROM_SCOPE_ESCAPED = '@deepseek-ai\\/'
 const TO_SCOPE_ESCAPED = '@prettier-ai\\/'
 
 /**
- * Files this repository copies onto a fetched official checkout before running
- * `--apply` there. They are also the paths the rewrite must never touch, since
- * they carry the pre-rescope scope tokens as data.
+ * Overlay files copied onto a fetched official checkout *before* `build:official`.
+ * Official `tsconfig.host.json` includes every .ts file under scripts/, so this list is only
+ * the rescope entry `--apply` needs. Files that keep `@deepseek-ai/` as data
+ * belong in `OVERLAY_POST_BUILD_SCRIPT_FILES`.
  */
-export const OVERLAY_SCRIPT_FILES: readonly string[] = [
+export const OVERLAY_PRE_BUILD_SCRIPT_FILES: readonly string[] = [
   'scripts/rescope-to-prettier-ai.ts',
+]
+
+/**
+ * Overlay files copied onto a fetched official checkout *after* `build:official`.
+ * They carry `@deepseek-ai/` as data (compat mapping, pack/publish) and must not
+ * sit in `scripts/` while official tsc runs.
+ */
+export const OVERLAY_POST_BUILD_SCRIPT_FILES: readonly string[] = [
   'scripts/rescope-to-prettier-ai.spec.ts',
   'scripts/probe-upstream-release.ts',
   'scripts/probe-upstream-release.spec.ts',
@@ -53,6 +64,16 @@ export const OVERLAY_SCRIPT_FILES: readonly string[] = [
   'scripts/bundle-cli.spec.ts',
 ]
 
+/**
+ * Files this repository copies onto a fetched official checkout. They are also
+ * the paths the rewrite must never touch, since they carry the pre-rescope
+ * scope tokens as data.
+ */
+export const OVERLAY_SCRIPT_FILES: readonly string[] = [
+  ...OVERLAY_PRE_BUILD_SCRIPT_FILES,
+  ...OVERLAY_POST_BUILD_SCRIPT_FILES,
+]
+
 /** Paths the rewrite must not touch: frozen upstream history and this overlay. */
 export const RESCOPE_SKIP_PREFIXES: readonly string[] = [
   '.agents/notes/archived/',
@@ -62,7 +83,8 @@ export const RESCOPE_SKIP_PREFIXES: readonly string[] = [
 
 /**
  * Trees whose shipped JS, tests, gates, or pack CI would break if package names
- * changed without rewriting specifiers.
+ * changed without rewriting specifiers. Includes root `examples/` (older official
+ * tags typecheck example tests from `tsconfig.host.json`).
  */
 export const PACK_SOURCE_PREFIXES: readonly string[] = [
   'packages/',
@@ -73,6 +95,7 @@ export const PACK_SOURCE_PREFIXES: readonly string[] = [
   'python/',
   'snapshots/',
   'website/',
+  'examples/',
 ]
 
 const PACK_SOURCE_EXTENSIONS: readonly string[] = [
