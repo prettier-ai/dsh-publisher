@@ -4,16 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { OVERLAY_SCRIPT_FILES, shouldRewritePath } from './rescope-to-prettier-ai.ts'
-import { decideCliTarballPublish } from './publish-cli-tarball.ts'
 import {
   assertDshpPackageShape,
   DSH_PACKAGE_NAME,
   DSHP_BIN_NAME,
   DSHP_BIN_PATH,
   DSHP_PACKAGE_NAME,
+  decideDshpTarballPublish,
   dshpManifestFor,
   findDshpTarball,
   packDshp,
+  publishPackedDshp,
 } from './publish-dshp.ts'
 
 const COMMITTED_DSHP = new URL('../packages/dshp/', import.meta.url)
@@ -116,12 +117,29 @@ describe('dshp wrapper', () => {
   })
 })
 
-describe('publish skip/conflict', () => {
-  it('uses the same integrity skip rules as the CLI publisher', () => {
-    const local = 'sha512-dshp'
-    expect(decideCliTarballPublish(local, { kind: 'absent' })).toBe('publish')
-    expect(decideCliTarballPublish(local, { kind: 'present', integrity: local })).toBe('skip')
-    expect(decideCliTarballPublish(local, { kind: 'present', integrity: 'sha512-other' })).toBe('conflict')
+describe('publish skip', () => {
+  it('skips when the version is already on npm, including a different integrity', () => {
+    expect(decideDshpTarballPublish({ kind: 'absent' })).toBe('publish')
+    expect(decideDshpTarballPublish({ kind: 'present', integrity: 'sha512-dshp' })).toBe('skip')
+    expect(decideDshpTarballPublish({ kind: 'present', integrity: 'sha512-other' })).toBe('skip')
+  })
+
+  it('does not publish or fail when the registry already has this dshp version', async () => {
+    const out = mkdtempSync(join(tmpdir(), 'dsh-dshp-skip-'))
+    packDshp(VERSION, out)
+    let publishes = 0
+    const fetchImpl: typeof fetch = async () =>
+      new Response(JSON.stringify({ dist: { integrity: 'sha512-already' } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    await publishPackedDshp(out, {
+      fetchImpl,
+      publish: () => {
+        publishes += 1
+      },
+    })
+    expect(publishes).toBe(0)
   })
 })
 

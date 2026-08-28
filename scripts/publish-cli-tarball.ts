@@ -7,11 +7,15 @@
  * published integrity: a mismatch fails instead of overwriting or inventing a
  * publisher-side version suffix. Wait for a new official tag.
  *
+ * After `npm publish` (or a skip), the script re-fetches the version document.
+ * HTTP 404 is a failure even if the CLI printed success. `npm publish` streams
+ * stdio so a large bundled listing cannot hit spawnSync maxBuffer.
+ *
  * Usage: `node --experimental-strip-types scripts/publish-cli-tarball.ts --from dist/npm-cli`
  */
 
-import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,6 +32,12 @@ export type RegistryIntegrity =
 
 /** What to do with a packed CLI tarball given the registry. */
 export type CliPublishDecision = 'publish' | 'skip' | 'conflict'
+
+/** Injected I/O for packing tests; production uses `fetch` and `npm publish`. */
+export interface TarballPublishIo {
+  readonly fetchImpl?: typeof fetch
+  readonly publish?: (tarball: string, version: string) => void
+}
 
 /**
  * Decide whether one local tarball may be published.
@@ -55,6 +65,18 @@ export function cliPublishConflictMessage(name: string, version: string): string
     + 'This workflow does not invent a publisher-side version suffix and will not overwrite the registry tarball. '
     + 'Wait for a new official tag (or dispatch Pack CLI / Publish CLI with that tag). '
     + 'The tarball from this run remains on the workflow artifacts.'
+  )
+}
+
+/**
+ * Error when GET of the version document is still 404 after publish.
+ * @param name - package name.
+ * @param version - exact version.
+ */
+export function registryMissingAfterPublishMessage(name: string, version: string): string {
+  return (
+    `${name}@${version} is not on the registry after publish `
+    + `(GET ${registryVersionUrl(name, version)} returned 404)`
   )
 }
 
@@ -127,6 +149,69 @@ export async function readRegistryIntegrity(
   return { kind: 'present', integrity }
 }
 
+/**
+ * Fail unless the exact version document exists on the registry.
+ * @param name - package name.
+ * @param version - exact version.
+ * @param fetchImpl - `fetch` (injected in tests).
+ */
+export async function assertRegistryHasVersion(
+  name: string,
+  version: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const registry = await readRegistryIntegrity(name, version, fetchImpl)
+  if (registry.kind === 'absent') {
+    throw new Error(registryMissingAfterPublishMessage(name, version))
+  }
+}
+
+/**
+ * Publish one tarball with streamed stdio. Status is the only success signal.
+ * @param tarball - path to the `.tgz`.
+ * @param version - exact version (prereleases use `--tag next`).
+ * @param extraArgs - extra `npm publish` flags, for example `--access public`.
+ */
+export function publishNpmTarball(
+  tarball: string,
+  version: string,
+  extraArgs: readonly string[] = [],
+): void {
+  const tagArgs = version.includes('-') ? ['--tag', 'next'] : []
+  const result = spawnSync('npm', ['publish', tarball, ...extraArgs, ...tagArgs], { stdio: 'inherit' })
+  if (result.error !== undefined) {
+    throw new Error(`npm publish ${tarball} failed: ${result.error.message}`)
+  }
+  if (result.status !== 0) {
+    throw new Error(`npm publish ${tarball} failed: exit ${String(result.status ?? 'null')}`)
+  }
+}
+
+/**
+ * Skip, refuse, or publish the CLI tarball, then re-fetch the version document.
+ * @param directory - directory of packed `.tgz` files.
+ * @param io - optional fetch/publish substitutes for tests.
+ */
+export async function publishPackedCli(directory: string, io: TarballPublishIo = {}): Promise<void> {
+  const fetchImpl = io.fetchImpl ?? fetch
+  const publish = io.publish ?? publishNpmTarball
+  const cli = findCliTarball(directory)
+  const local = tarballIntegrity(cli.file)
+  const registry = await readRegistryIntegrity(cli.name, cli.version, fetchImpl)
+  const decision = decideCliTarballPublish(local, registry)
+  if (decision === 'skip') {
+    console.log(`publish-cli-tarball: ${cli.name}@${cli.version} already published with matching integrity, skipping`)
+    await assertRegistryHasVersion(cli.name, cli.version, fetchImpl)
+    return
+  }
+  if (decision === 'conflict') {
+    throw new Error(cliPublishConflictMessage(cli.name, cli.version))
+  }
+  publish(cli.file, cli.version)
+  await assertRegistryHasVersion(cli.name, cli.version, fetchImpl)
+  console.log(`publish-cli-tarball: ${cli.name}@${cli.version} published`)
+}
+
 function distIntegrity(payload: unknown): string | undefined {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return undefined
   const dist = (payload as { dist?: unknown }).dist
@@ -148,17 +233,6 @@ function readPackedIdentity(tarball: string): { name: string; version: string } 
   return { name, version }
 }
 
-function publishTarball(tarball: string, version: string): void {
-  const tagArgs = version.includes('-') ? ['--tag', 'next'] : []
-  const result = spawnSync('npm', ['publish', tarball, ...tagArgs], { encoding: 'utf8' })
-  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
-  if (result.status === 0) {
-    if (output !== '') process.stdout.write(output)
-    return
-  }
-  throw new Error(`npm publish ${tarball} failed:\n${output}`)
-}
-
 async function main(): Promise<void> {
   const { values } = parseArgs({
     options: { from: { type: 'string' } },
@@ -168,19 +242,7 @@ async function main(): Promise<void> {
   if (from === undefined || from === '') {
     throw new Error('publish-cli-tarball: --from <packed directory> is required')
   }
-  const cli = findCliTarball(from)
-  const local = tarballIntegrity(cli.file)
-  const registry = await readRegistryIntegrity(cli.name, cli.version)
-  const decision = decideCliTarballPublish(local, registry)
-  if (decision === 'skip') {
-    console.log(`publish-cli-tarball: ${cli.name}@${cli.version} already published with matching integrity, skipping`)
-    return
-  }
-  if (decision === 'conflict') {
-    throw new Error(cliPublishConflictMessage(cli.name, cli.version))
-  }
-  publishTarball(cli.file, cli.version)
-  console.log(`publish-cli-tarball: ${cli.name}@${cli.version} published`)
+  await publishPackedCli(from)
 }
 
 if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {

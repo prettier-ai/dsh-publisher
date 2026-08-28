@@ -5,12 +5,17 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { OVERLAY_SCRIPT_FILES, shouldRewritePath } from './rescope-to-prettier-ai.ts'
 import {
+  assertRegistryHasVersion,
   cliPublishConflictMessage,
   decideCliTarballPublish,
   findCliTarball,
+  publishPackedCli,
   readRegistryIntegrity,
+  registryMissingAfterPublishMessage,
   tarballIntegrity,
 } from './publish-cli-tarball.ts'
+
+const VERSION = '0.1.1-rc.2'
 
 function packManifest(parent: string, manifest: Record<string, unknown>, tarballName: string): string {
   const packageDir = join(parent, 'package')
@@ -19,6 +24,24 @@ function packManifest(parent: string, manifest: Record<string, unknown>, tarball
   const tarball = join(parent, tarballName)
   execFileSync('tar', ['-czf', tarball, '-C', parent, 'package'])
   return tarball
+}
+
+function packedCliDir(version = VERSION): string {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-publish-cli-'))
+  packManifest(dir, { name: '@prettier-ai/dsh', version }, `prettier-ai-dsh-${version}.tgz`)
+  return dir
+}
+
+function fetch404(): typeof fetch {
+  return async () => new Response('Not Found', { status: 404, statusText: 'Not Found' })
+}
+
+function fetchPresent(integrity: string): typeof fetch {
+  return async () =>
+    new Response(JSON.stringify({ dist: { integrity } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
 }
 
 describe('decideCliTarballPublish', () => {
@@ -44,22 +67,64 @@ describe('decideCliTarballPublish', () => {
 
 describe('readRegistryIntegrity', () => {
   it('treats HTTP 404 as unpublished', async () => {
-    const fetchImpl: typeof fetch = async () => new Response('Not Found', { status: 404, statusText: 'Not Found' })
-    await expect(readRegistryIntegrity('@prettier-ai/dsh', '0.1.2-alpha.1', fetchImpl)).resolves.toEqual({
+    await expect(readRegistryIntegrity('@prettier-ai/dsh', '0.1.2-alpha.1', fetch404())).resolves.toEqual({
       kind: 'absent',
     })
   })
 
   it('reads dist.integrity when the version exists', async () => {
-    const fetchImpl: typeof fetch = async () =>
-      new Response(JSON.stringify({ dist: { integrity: 'sha512-abc' } }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    await expect(readRegistryIntegrity('@prettier-ai/dsh', '0.1.2-alpha.1', fetchImpl)).resolves.toEqual({
+    await expect(readRegistryIntegrity('@prettier-ai/dsh', '0.1.2-alpha.1', fetchPresent('sha512-abc'))).resolves.toEqual({
       kind: 'present',
       integrity: 'sha512-abc',
     })
+  })
+})
+
+describe('assertRegistryHasVersion', () => {
+  it('fails when GET of the version document is 404', async () => {
+    await expect(assertRegistryHasVersion('@prettier-ai/dsh', VERSION, fetch404())).rejects.toThrow(
+      registryMissingAfterPublishMessage('@prettier-ai/dsh', VERSION),
+    )
+  })
+
+  it('accepts a version document that includes dist.integrity', async () => {
+    await expect(assertRegistryHasVersion('@prettier-ai/dsh', VERSION, fetchPresent('sha512-abc'))).resolves.toBeUndefined()
+  })
+})
+
+describe('publishPackedCli', () => {
+  it('does not succeed when npm publish returns and the version is still absent', async () => {
+    const dir = packedCliDir()
+    let publishes = 0
+    await expect(publishPackedCli(dir, {
+      fetchImpl: fetch404(),
+      publish: () => {
+        publishes += 1
+      },
+    })).rejects.toThrow(registryMissingAfterPublishMessage('@prettier-ai/dsh', VERSION))
+    expect(publishes).toBe(1)
+  })
+
+  it('logs published only after the version document exists', async () => {
+    const dir = packedCliDir()
+    let fetches = 0
+    const fetchImpl: typeof fetch = async () => {
+      fetches += 1
+      if (fetches === 1) return new Response('Not Found', { status: 404, statusText: 'Not Found' })
+      return new Response(JSON.stringify({ dist: { integrity: 'sha512-after' } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    let publishes = 0
+    await publishPackedCli(dir, {
+      fetchImpl,
+      publish: () => {
+        publishes += 1
+      },
+    })
+    expect(publishes).toBe(1)
+    expect(fetches).toBe(2)
   })
 })
 
@@ -98,6 +163,17 @@ describe('Pack CLI / Publish CLI workflow', () => {
     expect(yaml).toContain('bundle-cli.ts --workspace . --out dist/npm-cli')
     expect(yaml).toContain('inject-deepseek-ai-compat.ts --check --applied --from dist/npm-cli')
     expect(yaml).toContain('publish-cli-tarball.ts --from dist/npm-cli')
+  })
+
+  it('captures CLI publish failure with || so bash $? is not zero after if !', () => {
+    const yaml = readFileSync(new URL('../.github/workflows/publish-cli.yml', import.meta.url), 'utf8')
+    expect(yaml).toContain(
+      'node --experimental-strip-types scripts/publish-cli-tarball.ts --from dist/npm-cli || cli_status=$?',
+    )
+    expect(yaml).not.toMatch(/if ! node --experimental-strip-types scripts\/publish-cli-tarball\.ts/)
+    const src = readFileSync(new URL('./publish-cli-tarball.ts', import.meta.url), 'utf8')
+    expect(src).toContain("stdio: 'inherit'")
+    expect(src).toContain('assertRegistryHasVersion')
   })
 
   it('does not rewrite the publish overlay scripts themselves', () => {
