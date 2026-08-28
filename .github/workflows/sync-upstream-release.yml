@@ -120,6 +120,8 @@ jobs:
              scripts/rescope-to-prettier-ai.spec.ts \
              scripts/probe-upstream-release.ts \
              scripts/probe-upstream-release.spec.ts \
+             scripts/inject-deepseek-ai-compat.ts \
+             scripts/inject-deepseek-ai-compat.spec.ts \
              upstream/scripts/
 
       - uses: actions/setup-node@v6
@@ -153,6 +155,16 @@ jobs:
           set -euo pipefail
           pnpm run release:pack --family vendor --out dist/npm-vendor
           pnpm run release:pack --family dsh --out dist/npm
+
+      # After pack, rewrite the packed CLI tarball: npm aliases plus a Node
+      # module hook on the bin. Do not add @deepseek-ai/* deps before pnpm
+      # install — that would make CI fetch those names from the registry.
+      - name: Inject @deepseek-ai/* compatibility into packed app tarballs
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --apply --from dist/npm
+          node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --check --applied --from dist/npm
 
       # Artifacts are uploaded before publish so a missing token or a failed
       # publish still leaves the packed tarballs on the workflow run.
