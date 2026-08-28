@@ -590,6 +590,18 @@ describe('workflows', () => {
     expect(cli).not.toMatch(/^\s+pnpm run release:pack --family/m)
   })
 
+  it('resolves published npm version from the publisher checkout, not upstream/', () => {
+    const cli = readFileSync(new URL('../.github/workflows/publish-cli.yml', import.meta.url), 'utf8')
+    const marker = '\n      - name: Resolve published npm version\n'
+    const start = cli.indexOf(marker)
+    expect(start).toBeGreaterThan(-1)
+    const from = cli.slice(start + 1)
+    const next = from.search(/\n      - (?:name:|uses:)/)
+    const step = next === -1 ? from : from.slice(0, next)
+    expect(step).toContain('--published-version --official')
+    expect(step).not.toContain('working-directory: upstream')
+  })
+
   it('lets Pack CLI take an operator-supplied suffix and keeps Sync suffix-free', () => {
     const sync = readFileSync(new URL('../.github/workflows/sync-upstream-release.yml', import.meta.url), 'utf8')
     const cli = readFileSync(new URL('../.github/workflows/publish-cli.yml', import.meta.url), 'utf8')
