@@ -6,17 +6,50 @@ import { describe, expect, it } from 'vitest'
 import {
   checkAppliedRescope,
   checkRescope,
+  OVERLAY_POST_BUILD_SCRIPT_FILES,
+  OVERLAY_PRE_BUILD_SCRIPT_FILES,
   OVERLAY_SCRIPT_FILES,
+  PACK_SOURCE_PREFIXES,
   rewriteFileContents,
   shouldRewritePath,
   rescopeTree,
 } from './rescope-to-prettier-ai.ts'
+
+const PRE_BUILD_COPY_STEP = 'Copy the rescope overlay onto the official checkout'
+const POST_BUILD_COPY_STEP = 'Copy the remaining overlay scripts onto the official checkout'
 
 function writeOverlayScriptFiles(dir: string): void {
   for (const file of OVERLAY_SCRIPT_FILES) {
     mkdirSync(join(dir, dirname(file)), { recursive: true })
     writeFileSync(join(dir, file), '// overlay stub\n')
   }
+}
+
+function workflowYaml(kind: 'sync' | 'cli'): string {
+  const file = kind === 'sync'
+    ? '../.github/workflows/sync-upstream-release.yml'
+    : '../.github/workflows/publish-cli.yml'
+  return readFileSync(new URL(file, import.meta.url), 'utf8')
+}
+
+function workflowStepBody(yaml: string, stepName: string): string {
+  const marker = `\n      - name: ${stepName}\n`
+  const start = yaml.indexOf(marker)
+  if (start === -1) throw new Error(`missing workflow step ${JSON.stringify(stepName)}`)
+  const from = yaml.slice(start + 1)
+  const next = from.search(/\n      - (?:name:|uses:)/)
+  return next === -1 ? from : from.slice(0, next)
+}
+
+function copiedScriptPaths(stepBody: string): string[] {
+  return [...stepBody.matchAll(/scripts\/[A-Za-z0-9._-]+\.ts/g)].map(match => match[0])
+}
+
+function splitAroundBuildOfficial(yaml: string): { before: string; after: string } {
+  const marker = 'pnpm run build:official'
+  const idx = yaml.indexOf(marker)
+  if (idx === -1) throw new Error('missing pnpm run build:official')
+  return { before: yaml.slice(0, idx), after: yaml.slice(idx) }
 }
 
 describe('shouldRewritePath', () => {
@@ -50,6 +83,14 @@ describe('shouldRewritePath', () => {
     expect(shouldRewritePath('AGENTS.md')).toBe(true)
   })
 
+  it('rewrites official examples tests that older tags typecheck during build:official', () => {
+    expect(PACK_SOURCE_PREFIXES).toContain('examples/')
+    expect(shouldRewritePath('examples/acp-agent/tests/acp.e2e.ts')).toBe(true)
+    expect(shouldRewritePath('examples/acp-agent/tests/fixtures/child-question-tripwire.ts')).toBe(true)
+    expect(shouldRewritePath('examples/headless-agent/tests/code-mode.e2e.ts')).toBe(true)
+    expect(shouldRewritePath('examples/acp-agent/README.md')).toBe(false)
+  })
+
   it('does not rewrite docs, website copy, README headings, or catalog markdown', () => {
     expect(shouldRewritePath('docs/config-catalog.md')).toBe(false)
     expect(shouldRewritePath('docs/rescope.md')).toBe(false)
@@ -79,6 +120,13 @@ describe('rewriteFileContents', () => {
       'https://github.com/deepseek-harness/deepseek-harness.git',
       '[catalog](../docs/tool-catalog.md#deepseek-aidsh-tool-todo)',
     ].join('\n'))
+  })
+
+  it('rewrites leftover @deepseek-ai imports in official examples tests', () => {
+    expect(rewriteFileContents(
+      'examples/acp-agent/tests/acp.e2e.ts',
+      "import { launchAcpTestAgent } from '@deepseek-ai/dsh-acp-snapshot'\n",
+    )).toBe("import { launchAcpTestAgent } from '@prettier-ai/dsh-acp-snapshot'\n")
   })
 
   it('rewrites regex-escaped package prefixes used in source literals', () => {
@@ -153,6 +201,37 @@ describe('checkRescope', () => {
   })
 })
 
+describe('overlay copy relative to build:official', () => {
+  it('copies only rescope files before official tsc, and the rest after', () => {
+    expect(OVERLAY_SCRIPT_FILES).toEqual([
+      ...OVERLAY_PRE_BUILD_SCRIPT_FILES,
+      ...OVERLAY_POST_BUILD_SCRIPT_FILES,
+    ])
+    expect(OVERLAY_PRE_BUILD_SCRIPT_FILES.some(file => OVERLAY_POST_BUILD_SCRIPT_FILES.includes(file))).toBe(false)
+    expect(OVERLAY_PRE_BUILD_SCRIPT_FILES).toEqual([
+      'scripts/rescope-to-prettier-ai.ts',
+    ])
+    expect(OVERLAY_POST_BUILD_SCRIPT_FILES).toContain('scripts/inject-deepseek-ai-compat.ts')
+    expect(OVERLAY_POST_BUILD_SCRIPT_FILES).toContain('scripts/bundle-cli.ts')
+    expect(OVERLAY_POST_BUILD_SCRIPT_FILES).toContain('scripts/publish-cli-tarball.ts')
+    expect(OVERLAY_POST_BUILD_SCRIPT_FILES).toContain('scripts/publish-dshp.ts')
+
+    for (const kind of ['sync', 'cli'] as const) {
+      const yaml = workflowYaml(kind)
+      const { before, after } = splitAroundBuildOfficial(yaml)
+      expect(before).toContain(PRE_BUILD_COPY_STEP)
+      expect(before).not.toContain(POST_BUILD_COPY_STEP)
+      expect(after).toContain(POST_BUILD_COPY_STEP)
+      expect(copiedScriptPaths(workflowStepBody(yaml, PRE_BUILD_COPY_STEP))).toEqual(
+        [...OVERLAY_PRE_BUILD_SCRIPT_FILES],
+      )
+      expect(copiedScriptPaths(workflowStepBody(yaml, POST_BUILD_COPY_STEP))).toEqual(
+        [...OVERLAY_POST_BUILD_SCRIPT_FILES],
+      )
+    }
+  })
+})
+
 describe('rescopeTree', () => {
   it('writes eligible files, skips docs residue, and checkAppliedRescope accepts the pack-only post-state', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rescope-to-prettier-ai-'))
@@ -215,6 +294,23 @@ describe('rescopeTree', () => {
     execFileSync('git', ['init'], { cwd: dir })
     execFileSync('git', ['add', '--', 'apps/cli/package.json', 'docs/config-catalog.md'], { cwd: dir })
     expect(() => checkAppliedRescope(dir)).not.toThrow()
+  })
+
+  it('rewrites examples tests that official tsc includes on older tags', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rescope-examples-'))
+    mkdirSync(join(dir, 'examples/acp-agent/tests'), { recursive: true })
+    writeFileSync(
+      join(dir, 'examples/acp-agent/tests/acp.e2e.ts'),
+      "import { launchAcpTestAgent } from '@deepseek-ai/dsh-acp-snapshot'\n",
+    )
+    const changed = rescopeTree(dir, {
+      apply: true,
+      files: ['examples/acp-agent/tests/acp.e2e.ts'],
+    })
+    expect(changed.map(entry => entry.file)).toEqual(['examples/acp-agent/tests/acp.e2e.ts'])
+    expect(readFileSync(join(dir, 'examples/acp-agent/tests/acp.e2e.ts'), 'utf8')).toBe(
+      "import { launchAcpTestAgent } from '@prettier-ai/dsh-acp-snapshot'\n",
+    )
   })
 
   it('rejects checkAppliedRescope when the CLI package is still in the upstream scope', () => {
