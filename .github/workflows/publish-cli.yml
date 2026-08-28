@@ -10,20 +10,30 @@
 # The job still fetches the official tag, rescopes the checkout, builds, then
 # `pnpm deploy`s `apps/cli` from the resolved lockfile so the published CLI
 # tarball includes production `node_modules` and does not list the workspace
-# packages as `dependencies` (npm must not resolve that peer graph). The
-# runtime `@deepseek-ai/*` loader is applied to that bundled tree. It then
-# packs `@prettier-ai/dshp` from this repository, uploads both, and
-# `npm publish`es them when NPM_TOKEN is set. It never calls
+# packages as `dependencies` (npm must not resolve that peer graph). After
+# deploy it copies nested workspace packages that `pnpm deploy --prod --legacy`
+# omitted (for example `@prettier-ai/cosmokit` via cordis) into that tree as
+# real directories. The runtime `@deepseek-ai/*` loader is applied to that
+# bundled tree. It then packs `@prettier-ai/dshp` from this repository, uploads
+# both, and `npm publish`es them when NPM_TOKEN is set. It never calls
 # `release:pack --family` or `release:publish --family`.
 #
-# Versions still mirror the official release. This workflow does not invent a
-# publisher-side version suffix. If `@prettier-ai/dsh@<version>` is already on
-# npm with different contents (for example a Sync run published a thin CLI at
-# that version), CLI publish fails on integrity mismatch — wait for a new
-# official tag, or inspect the tarball on this run's artifacts.
-# `@prettier-ai/dshp` skips without failing when that wrapper is already on npm
-# (Pack CLI #4 published dshp after the CLI PUT was rejected). It does not
-# overwrite `@prettier-ai/dsh`.
+# Source git tag is still the official tag from `tag` / the probe. Optional
+# input `npm_version` is an operator override for a burned registry
+# name@version (npm never reuses it after publish). Empty keeps the official
+# probe version. When set, that exact string is the published version for the
+# bundled CLI and dshp — it is not a suffix and is not auto-appended. Example:
+# `tag` `dsh-v0.1.1-rc.2` + `npm_version` `0.1.1-rc.2-bundle.1` publishes
+# `@prettier-ai/dsh@0.1.1-rc.2-bundle.1` and `@prettier-ai/dshp@0.1.1-rc.2-bundle.1`
+# while leaving `0.1.1-rc.2` on the registry. Optional `suffix` still joins as
+# `{official}-{suffix}` when `npm_version` is empty; if both are set,
+# `npm_version` wins. Versions containing `-` use `npm publish --tag next` and
+# do not move `latest`. Sync upstream release stays override-free. If
+# `@prettier-ai/dsh@<published-version>` is already on npm with different
+# contents, CLI publish fails on integrity mismatch — pass a new unpublished
+# `npm_version`, wait for a new official tag, or inspect the tarball on this
+# run's artifacts. `@prettier-ai/dshp` still publishes in that case when it is
+# absent from npm; it does not overwrite `@prettier-ai/dsh`.
 #
 # Optional input `tag`: empty uses the same probe as Sync (latest stable, else
 # newest non-draft including prereleases).
@@ -39,6 +49,14 @@ on:
     inputs:
       tag:
         description: 'Upstream git tag (empty = latest stable, else newest non-draft including prereleases)'
+        required: false
+        type: string
+      suffix:
+        description: 'Optional npm prerelease suffix joined with a hyphen (e.g. bundle.1 → 0.1.1-rc.2-bundle.1). Empty = official version. Ignored when npm_version is set. Does not move latest.'
+        required: false
+        type: string
+      npm_version:
+        description: 'Optional published npm version override (e.g. 0.1.1-rc.2-bundle.1 while tag is dsh-v0.1.1-rc.2). Empty = official probe version. Does not unpublish or reuse a burned name@version. Wins over suffix when both are set. Does not move latest.'
         required: false
         type: string
 
@@ -99,7 +117,9 @@ jobs:
     needs: decide
     # Pack even when the probe would skip a full-family Sync (version already
     # on npm): the artifact is still useful, and publish-cli-tarball.ts refuses
-    # to overwrite a different registry tarball. dshp can still ship.
+    # to overwrite a different registry tarball. npm_version (or suffix) publishes
+    # a new npm version for the same official tag without unpublishing. dshp can
+    # still ship.
     if: needs.decide.outputs.tag != ''
     runs-on: ubuntu-24.04
     env:
@@ -130,6 +150,19 @@ jobs:
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
           registry-url: https://registry.npmjs.org
+
+      - name: Resolve published npm version
+        id: publish-version
+        env:
+          SUFFIX: ${{ inputs.suffix }}
+          NPM_VERSION: ${{ inputs.npm_version }}
+        run: |
+          set -euo pipefail
+          published="$(node --experimental-strip-types scripts/bundle-cli.ts --published-version --official "${VERSION}" --suffix "${SUFFIX:-}" --npm-version "${NPM_VERSION:-}")"
+          echo "version=${published}" >> "${GITHUB_OUTPUT}"
+          echo "PUBLISHED_VERSION=${published}" >> "${GITHUB_ENV}"
+          echo "official version: ${VERSION}"
+          echo "published npm version: ${published}"
 
       - name: Apply the rescope to the official checkout
         working-directory: upstream
@@ -172,7 +205,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/npm-cli
-          node --experimental-strip-types scripts/bundle-cli.ts --workspace . --out dist/npm-cli
+          node --experimental-strip-types scripts/bundle-cli.ts --workspace . --out dist/npm-cli --version "${PUBLISHED_VERSION}"
 
       - name: Verify @deepseek-ai/* compatibility on the bundled CLI tarball
         working-directory: upstream
@@ -183,11 +216,11 @@ jobs:
       - name: Pack @prettier-ai/dshp
         run: |
           set -euo pipefail
-          node --experimental-strip-types scripts/publish-dshp.ts --pack --version "${VERSION}" --out dist/npm-dshp
+          node --experimental-strip-types scripts/publish-dshp.ts --pack --version "${PUBLISHED_VERSION}" --out dist/npm-dshp
 
       - uses: actions/upload-artifact@v4
         with:
-          name: prettier-ai-dsh-cli-${{ needs.decide.outputs.version }}
+          name: prettier-ai-dsh-cli-${{ steps.publish-version.outputs.version }}
           path: |
             upstream/dist/npm-cli/*
             dist/npm-dshp/*
