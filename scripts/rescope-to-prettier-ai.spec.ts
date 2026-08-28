@@ -26,6 +26,10 @@ describe('shouldRewritePath', () => {
     expect(shouldRewritePath('scripts/rescope-to-prettier-ai.spec.ts')).toBe(false)
     expect(shouldRewritePath('scripts/probe-upstream-release.ts')).toBe(false)
     expect(shouldRewritePath('scripts/probe-upstream-release.spec.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/inject-deepseek-ai-compat.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/inject-deepseek-ai-compat.spec.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/publish-cli-tarball.ts')).toBe(false)
+    expect(shouldRewritePath('scripts/publish-cli-tarball.spec.ts')).toBe(false)
   })
 
   it('rewrites manifests, shipped sources, release scripts, the lockfile, and pack workflows', () => {

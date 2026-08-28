@@ -43,6 +43,10 @@ export const OVERLAY_SCRIPT_FILES: readonly string[] = [
   'scripts/rescope-to-prettier-ai.spec.ts',
   'scripts/probe-upstream-release.ts',
   'scripts/probe-upstream-release.spec.ts',
+  'scripts/inject-deepseek-ai-compat.ts',
+  'scripts/inject-deepseek-ai-compat.spec.ts',
+  'scripts/publish-cli-tarball.ts',
+  'scripts/publish-cli-tarball.spec.ts',
 ]
 
 /** Paths the rewrite must not touch: frozen upstream history and this overlay. */
