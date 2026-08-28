@@ -5,10 +5,12 @@
 # applies the pack-only rescope there, then packs and publishes from there.
 #
 # GitHub Actions cannot subscribe to another repository's releases, so this
-# workflow polls GET /repos/deepseek-ai/deepseek-harness/releases/latest every
-# five minutes and accepts a manual tag. GitHub cron is best-effort and may
-# drift or drop runs. /releases/latest never returns prereleases; an operator
-# must dispatch this workflow with an explicit tag to publish one.
+# workflow polls every five minutes and accepts a manual tag. GitHub cron is
+# best-effort and may drift or drop runs. The probe tries GET
+# /repos/deepseek-ai/deepseek-harness/releases/latest first. If that 404s or
+# there is no non-prerelease latest, it falls back to the newest non-draft
+# release (GET /releases?per_page=1), which includes prereleases. Drafts are
+# skipped. An operator may still dispatch with an explicit tag.
 #
 # Required secret: NPM_TOKEN — an npm token with publish access to the
 # prettier-ai org (Settings -> Secrets and variables -> Actions). When it is
@@ -27,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Upstream git tag (empty = latest non-prerelease GitHub Release)'
+        description: 'Upstream git tag (empty = latest stable, else newest non-draft including prereleases)'
         required: false
         type: string
 

@@ -22,7 +22,7 @@ Standalone publisher that republishes official [DeepSeek Harness](https://github
 
 The cheap `decide` job sparse-checkouts only `scripts/probe-upstream-release.ts` and runs it with Node 24 type stripping — no package installation. The probe:
 
-1. Resolves the upstream tag: `GET /repos/deepseek-ai/deepseek-harness/releases/latest`, or the operator-supplied tag on dispatch. `/releases/latest` never returns drafts or prereleases.
+1. Resolves the upstream tag. With no operator tag it tries `GET /repos/deepseek-ai/deepseek-harness/releases/latest`. If that 404s or there is no non-prerelease latest, it falls back to the newest non-draft GitHub Release from `GET /releases?per_page=1` (this includes prereleases). Drafts are skipped. A dispatch `--tag` still names a specific tag, including prereleases. If upstream has no releases at all, the probe skips.
 2. Reads `apps/cli/package.json` at that tag to learn the npm version (falling back to the tag suffix if the file is unavailable).
 3. Decides one of:
    - `skip` — `@prettier-ai/dsh@<version>` already exists on the npm registry. The heavy job does not run.
@@ -46,7 +46,7 @@ The rescope rewrites package manifests, shipped source specifiers, the lockfile,
 
 ### Manual dispatch
 
-Run the `Sync upstream release` workflow from the Actions tab (or `gh workflow run`). The optional `tag` input names an upstream git tag directly. This is required for prereleases: `/releases/latest` skips them, so an alpha or beta is published only when an operator passes its tag explicitly.
+Run the `Sync upstream release` workflow from the Actions tab (or `gh workflow run`). The optional `tag` input names an upstream git tag directly. Leave it empty to use the same latest-then-newest-non-draft selection as the schedule.
 
 ### Tracking refs
 
