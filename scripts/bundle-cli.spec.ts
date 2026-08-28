@@ -18,6 +18,7 @@ import {
   prettierAiDshStarDependencyNames,
   removePackedCliTarballs,
   scopedWorkspaceDependencyNames,
+  tarballHasPathPrefix,
 } from './bundle-cli.ts'
 
 const VERSION = '0.1.2-alpha.1'
@@ -62,6 +63,15 @@ function writeDeployFixture(packageDir: string): void {
     name: 'commander',
     version: '15.0.0',
   }, null, 2)}\n`)
+}
+
+/** Enough long-named members that `tar -tzf` stdout exceeds Node's 1 MiB maxBuffer. */
+function writeFilesToInflateTarListing(dir: string): void {
+  mkdirSync(dir, { recursive: true })
+  const pad = 'n'.repeat(200)
+  for (let i = 0; i < 8000; i++) {
+    writeFileSync(join(dir, `${pad}-${String(i).padStart(4, '0')}`), '')
+  }
 }
 
 function packThinCli(parent: string, name: string, version: string, tarballName: string): string {
@@ -186,6 +196,31 @@ describe('packBundledDirectory', () => {
     expect(prettierAiDshStarDependencyNames(written.dependencies)).toEqual([])
     expect(scopedWorkspaceDependencyNames(written.dependencies)).toEqual([])
     expect(readFileSync(join(packageDir, 'lib/bin.js'), 'utf8')).toContain(DEEPSEEK_AI_COMPAT_MARKER)
+  })
+
+  it('packs a deploy tree whose tar listing exceeds Node spawnSync maxBuffer', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-enobufs-'))
+    writeDeployFixture(packageDir)
+    writeFilesToInflateTarListing(join(packageDir, 'node_modules'))
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-enobufs-out-'))
+    const packed = packBundledDirectory(packageDir, out)
+    const raw = spawnSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
+    expect(raw.error).toMatchObject({ code: 'ENOBUFS' })
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/')).toBe(true)
+    expect(() => checkAppliedCompat(out)).not.toThrow()
+  })
+})
+
+describe('tarballHasPathPrefix', () => {
+  it('returns false when the prefix is absent from a small tarball', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-prefix-'))
+    const packageDir = join(root, 'package')
+    mkdirSync(packageDir, { recursive: true })
+    writeFileSync(join(packageDir, 'package.json'), '{}\n')
+    const tarball = join(root, 'small.tgz')
+    execFileSync('tar', ['-czf', tarball, '-C', root, 'package'])
+    expect(tarballHasPathPrefix(tarball, 'package/node_modules/')).toBe(false)
+    expect(tarballHasPathPrefix(tarball, 'package/package.json')).toBe(true)
   })
 })
 

@@ -35,7 +35,7 @@
  * [--apply|--check --applied] --from dist/npm`
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   existsSync,
@@ -277,10 +277,9 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
       )
     }
   }
-  const files = tarballListing(tarball)
   for (const relPath of binRelPaths(manifest)) {
     const packedBin = `package/${relPath.replaceAll('\\', '/')}`
-    if (!files.includes(packedBin)) {
+    if (!tarballHasMember(tarball, packedBin)) {
       failures.push(`${filename}: missing bin ${packedBin}`)
       continue
     }
@@ -295,11 +294,11 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
       )
     }
     const inner = innerBinRelPath(relPath)
-    if (!files.includes(`package/${inner.replaceAll('\\', '/')}`)) {
+    if (!tarballHasMember(tarball, `package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
     }
     const loader = join(dirname(relPath), LOADER_FILENAME).replaceAll('\\', '/')
-    if (!files.includes(`package/${loader}`)) {
+    if (!tarballHasMember(tarball, `package/${loader}`)) {
       failures.push(`${filename}: missing ${loader}`)
     }
   }
@@ -505,8 +504,20 @@ function readPackedManifest(tarball: string): PackedManifest {
   return parsed as PackedManifest
 }
 
-function tarballListing(tarball: string): string[] {
-  return execFileSync('tar', ['-tzf', tarball], { encoding: 'utf8' }).split('\n').filter(line => line !== '')
+/**
+ * Whether a packed tarball contains one exact member path.
+ * Looks up that member only; a full `tar -tzf` of bundled `node_modules`
+ * exceeds Node's 1 MiB spawnSync maxBuffer (`ENOBUFS`) on official tags.
+ * @param tarball - path to a `.tgz`.
+ * @param member - archive member, for example `package/lib/bin.js`.
+ */
+function tarballHasMember(tarball: string, member: string): boolean {
+  const result = spawnSync('tar', ['-tzf', tarball, member], {
+    encoding: 'utf8',
+    maxBuffer: 65536,
+  })
+  if (result.status !== 0) return false
+  return (result.stdout ?? '').split('\n').includes(member)
 }
 
 function listTarballs(directory: string): string[] {
