@@ -28,6 +28,9 @@
  *    dependency, so `healProfilesModuleFallback` and `resolve.paths` still
  *    find physical `@deepseek-ai/*` directories for existing profile manifests.
  *
+ * The published CLI bin name stays `dsh`. This overlay wraps the file at
+ * `lib/bin.js`; it does not rename `bin.dsh` in package.json.
+ *
  * Usage: `node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts
  * [--apply|--check --applied] --from dist/npm`
  */
@@ -55,6 +58,8 @@ const ENTRY_PACKAGE = '@prettier-ai/dsh'
 const COMPAT_MARKER = 'prettier-ai:deepseek-ai-compat'
 const LOADER_FILENAME = 'deepseek-ai-compat-loader.js'
 const INSTALL_SECTIONS = ['dependencies', 'optionalDependencies'] as const
+const PUBLISHED_CLI_BIN = 'dsh'
+const PUBLISHED_CLI_BIN_PATH = 'lib/bin.js'
 
 /** Marker comment written into the wrapped CLI bin. Exported for tests. */
 export const DEEPSEEK_AI_COMPAT_MARKER = COMPAT_MARKER
@@ -260,6 +265,7 @@ export function checkAppliedCompat(directory: string): void {
 
 function checkPackedApp(tarball: string, filename: string, manifest: PackedManifest): string[] {
   const failures: string[] = []
+  failures.push(...checkPublishedCliBin(filename, manifest))
   for (const section of INSTALL_SECTIONS) {
     const deps = stringRecord(manifest[section])
     const aliases = deepseekAiAliasesFor(deps)
@@ -282,6 +288,12 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
     if (!body.includes(COMPAT_MARKER)) {
       failures.push(`${filename}: ${relPath} is not the compatibility wrapper`)
     }
+    if (body.includes('async function resolveMapped')) {
+      failures.push(
+        `${filename}: ${relPath} registerHooks resolve must be synchronous `
+        + '(Node 24 resolveSync rejects a Promise url)',
+      )
+    }
     const inner = innerBinRelPath(relPath)
     if (!files.includes(`package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
@@ -290,6 +302,38 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
     if (!files.includes(`package/${loader}`)) {
       failures.push(`${filename}: missing ${loader}`)
     }
+  }
+  return failures
+}
+
+/**
+ * `@prettier-ai/dsh` keeps the upstream `dsh` bin. Compatibility wraps the
+ * file at `lib/bin.js`; it must not rename the published command.
+ */
+function checkPublishedCliBin(filename: string, manifest: PackedManifest): string[] {
+  if (manifest.name !== ENTRY_PACKAGE) return []
+  const failures: string[] = []
+  const bin = manifest.bin
+  if (typeof bin === 'string') {
+    if (bin !== PUBLISHED_CLI_BIN_PATH) {
+      failures.push(
+        `${filename}: @prettier-ai/dsh string bin is ${JSON.stringify(bin)}, expected ${JSON.stringify(PUBLISHED_CLI_BIN_PATH)}`,
+      )
+    }
+    return failures
+  }
+  if (bin === null || typeof bin !== 'object' || Array.isArray(bin)) {
+    failures.push(`${filename}: @prettier-ai/dsh is missing bin.${PUBLISHED_CLI_BIN}`)
+    return failures
+  }
+  const record = bin as Record<string, unknown>
+  if (record[PUBLISHED_CLI_BIN] !== PUBLISHED_CLI_BIN_PATH) {
+    failures.push(
+      `${filename}: @prettier-ai/dsh bin.${PUBLISHED_CLI_BIN} is ${JSON.stringify(record[PUBLISHED_CLI_BIN])}, expected ${JSON.stringify(PUBLISHED_CLI_BIN_PATH)}`,
+    )
+  }
+  if ('dshp' in record) {
+    failures.push(`${filename}: @prettier-ai/dsh must not publish a dshp bin`)
   }
   return failures
 }
@@ -351,11 +395,13 @@ function findInstallRoot(fromUrl) {
   }
 }
 
-async function resolveMapped(specifier, context, nextResolve, cliParentURL) {
+function resolveMapped(specifier, context, nextResolve, cliParentURL) {
   const mapped = mapSpecifier(specifier)
   if (mapped === undefined) return nextResolve(specifier, context)
   try {
-    return await nextResolve(mapped, { ...context, parentURL: cliParentURL })
+    // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
+    // Returning a Promise makes url undefined (ERR_INVALID_RETURN_PROPERTY_VALUE).
+    return nextResolve(mapped, { ...context, parentURL: cliParentURL })
   } catch {
     return nextResolve(specifier, context)
   }

@@ -128,8 +128,11 @@ describe('injectPackageDir', () => {
     expect(first.changed).toBe(true)
     expect(first.wrappedBins).toEqual(['lib/bin.js'])
     const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+      bin: Record<string, string>
       dependencies: Record<string, string>
     }
+    expect(manifest.bin).toEqual({ dsh: 'lib/bin.js' })
+    expect(manifest.bin).not.toHaveProperty('dshp')
     expect(manifest.dependencies['@deepseek-ai/cordis']).toBe('npm:@prettier-ai/cordis@4.0.1')
     expect(manifest.dependencies['@deepseek-ai/dsh-settings']).toBe(
       'npm:@prettier-ai/dsh-settings@0.1.2-alpha.1',
@@ -137,6 +140,8 @@ describe('injectPackageDir', () => {
     expect(manifest.dependencies.commander).toBe('^15.0.0')
     const wrapper = readFileSync(join(dir, 'lib/bin.js'), 'utf8')
     expect(wrapper.includes(DEEPSEEK_AI_COMPAT_MARKER)).toBe(true)
+    expect(wrapper).not.toMatch(/async function resolveMapped/)
+    expect(wrapper).toMatch(/function resolveMapped\(/)
     expect(readFileSync(join(dir, 'lib/bin.upstream.js'), 'utf8')).toContain('upstream-cli')
     expect(readFileSync(join(dir, 'lib/deepseek-ai-compat-loader.js'), 'utf8')).toContain('@deepseek-ai/')
     expect(readFileSync(overlay, 'utf8')).toBe(overlayBody)
@@ -145,6 +150,7 @@ describe('injectPackageDir', () => {
     expect(second.changed).toBe(false)
     expect(second.wrappedBins).toEqual([])
     expect(readFileSync(join(dir, 'lib/bin.js'), 'utf8')).toBe(wrapper)
+    expect(JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).bin).toEqual({ dsh: 'lib/bin.js' })
   })
 
   it('does not rewrite a library package', () => {
@@ -185,6 +191,13 @@ describe('injectTarball', () => {
     expect(first.skipped).toEqual(['prettier-ai-cordis-4.0.1.tgz'])
     expect(readFileSync(join(dist, 'prettier-ai-cordis-4.0.1.tgz'))).toEqual(libBefore)
     expect(() => checkAppliedCompat(dist)).not.toThrow()
+    const packedManifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', join(dist, 'prettier-ai-dsh-0.1.2-alpha.1.tgz'), 'package/package.json'], {
+        encoding: 'utf8',
+      }),
+    ) as { bin: Record<string, string> }
+    expect(packedManifest.bin).toEqual({ dsh: 'lib/bin.js' })
+    expect(packedManifest.bin).not.toHaveProperty('dshp')
 
     const cliBefore = readFileSync(join(dist, 'prettier-ai-dsh-0.1.2-alpha.1.tgz'))
     const second = injectPackedDirectory(dist, true)
@@ -241,6 +254,7 @@ describe('runtime hook', () => {
     ].join('\n'))
 
     injectPackageDir(host)
+    expect(JSON.parse(readFileSync(join(host, 'package.json'), 'utf8')).bin).toEqual({ dsh: 'lib/bin.js' })
     const result = execFileSync(process.execPath, [join(host, 'lib/bin.js'), pathToFileURL(plugin).href], {
       encoding: 'utf8',
       cwd: join(root, 'profile-plugin'),
