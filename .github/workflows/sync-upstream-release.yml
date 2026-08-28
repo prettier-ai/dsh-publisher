@@ -82,7 +82,14 @@ jobs:
           if [[ -n "${INPUT_TAG}" ]]; then
             extra+=(--tag "${INPUT_TAG}")
           fi
-          node scripts/probe-upstream-release.ts --github-output "${extra[@]}"
+          if [[ ! -f scripts/probe-upstream-release.ts ]]; then
+            echo "sparse-checkout did not leave scripts/probe-upstream-release.ts on disk" >&2
+            ls -la . scripts 2>/dev/null || true
+            exit 1
+          fi
+          # Cheap path: no pnpm install. Node 24 type-strips this file; pass the
+          # flag explicitly so a runner without default stripping still starts.
+          node --experimental-strip-types scripts/probe-upstream-release.ts --github-output "${extra[@]}"
 
   sync:
     name: Rescope, pack, publish
@@ -124,8 +131,8 @@ jobs:
         working-directory: upstream
         run: |
           set -euo pipefail
-          node scripts/rescope-to-prettier-ai.ts --apply
-          node scripts/rescope-to-prettier-ai.ts --check --applied
+          node --experimental-strip-types scripts/rescope-to-prettier-ai.ts --apply
+          node --experimental-strip-types scripts/rescope-to-prettier-ai.ts --check --applied
 
       - uses: pnpm/action-setup@v4
         with:

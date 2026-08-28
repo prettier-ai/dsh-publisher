@@ -8,8 +8,9 @@ import {
   gitHasTag,
   gitLsRemoteIndicatesMissing,
   isHttpNotFound,
-  npmViewIndicatesMissing,
+  npmHasVersion,
   probeUpstreamRelease,
+  registryVersionUrl,
   versionFromUpstreamTag,
 } from './probe-upstream-release.ts'
 
@@ -30,33 +31,33 @@ describe('isHttpNotFound', () => {
   })
 })
 
-describe('npmViewIndicatesMissing', () => {
-  it('treats unpublished scoped packages as missing, not as a crash', () => {
-    const unpublished = [
-      'npm error code E404',
-      'npm error 404 Not Found - GET https://registry.npmjs.org/@prettier-ai%2fdsh - Not found',
-      "npm error 404  '@prettier-ai/dsh@0.1.2-alpha.1' is not in this registry.",
-      JSON.stringify({
-        error: {
-          code: 'E404',
-          summary: 'Not Found - GET https://registry.npmjs.org/@prettier-ai%2fdsh - Not found',
-        },
-      }),
-    ].join('\n')
-    expect(npmViewIndicatesMissing(unpublished)).toBe(true)
+describe('registryVersionUrl', () => {
+  it('encodes the scoped entry package the way the npm registry expects', () => {
+    expect(registryVersionUrl('@prettier-ai/dsh', '0.1.2-alpha.1')).toBe(
+      'https://registry.npmjs.org/@prettier-ai%2fdsh/0.1.2-alpha.1',
+    )
+  })
+})
+
+describe('npmHasVersion', () => {
+  it('treats HTTP 404 as unpublished / missing, not as a crash', async () => {
+    const fetchImpl: typeof fetch = async (url) => {
+      expect(String(url)).toBe('https://registry.npmjs.org/@prettier-ai%2fdsh/0.1.2-alpha.1')
+      return new Response('Not Found', { status: 404, statusText: 'Not Found' })
+    }
+    await expect(npmHasVersion('@prettier-ai/dsh', '0.1.2-alpha.1', undefined, fetchImpl)).resolves.toBe(false)
   })
 
-  it('matches npm 404 / E404 / 404 Not Found / npm error code E404', () => {
-    expect(npmViewIndicatesMissing('E404')).toBe(true)
-    expect(npmViewIndicatesMissing('404 Not Found')).toBe(true)
-    expect(npmViewIndicatesMissing('npm error code E404')).toBe(true)
-    expect(npmViewIndicatesMissing('npm ERR! code E404')).toBe(true)
-    expect(npmViewIndicatesMissing('404')).toBe(true)
+  it('returns true when the registry has the version', async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response('{"version":"1.2.3"}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    await expect(npmHasVersion('@prettier-ai/dsh', '1.2.3', undefined, fetchImpl)).resolves.toBe(true)
   })
 
-  it('does not treat unrelated npm failures as unpublished', () => {
-    expect(npmViewIndicatesMissing('npm error code EPERM')).toBe(false)
-    expect(npmViewIndicatesMissing('getaddrinfo ENOTFOUND registry.npmjs.org')).toBe(false)
+  it('throws on unexpected registry failures', async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response('nope', { status: 500, statusText: 'Internal Server Error' })
+    await expect(npmHasVersion('@prettier-ai/dsh', '1.2.3', undefined, fetchImpl)).rejects.toThrow(/500/)
   })
 })
 

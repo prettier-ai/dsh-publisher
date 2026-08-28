@@ -5,11 +5,11 @@
  * repository's tracking tag already records the version.
  *
  * The scheduled decide job sparse-checkouts only this file and runs it with
- * Node 24 type stripping (`node scripts/probe-upstream-release.ts`); it does
- * not install anything. The skip path must stay fast because the schedule
- * fires every five minutes.
+ * Node 24 type stripping (`node --experimental-strip-types
+ * scripts/probe-upstream-release.ts`); it does not install anything. The skip
+ * path must stay fast because the schedule fires every five minutes.
  *
- * Usage: `node scripts/probe-upstream-release.ts [--tag <upstream-tag>] [--github-output]`.
+ * Usage: `node --experimental-strip-types scripts/probe-upstream-release.ts [--tag <upstream-tag>] [--github-output]`.
  * Without `--tag` the probe tries `GET /releases/latest` (non-prerelease). If
  * that 404s or there is no non-prerelease latest, it falls back to the newest
  * non-draft GitHub Release from `GET /releases?per_page=1` (includes
@@ -19,12 +19,13 @@
  *
  * First-publish probes must treat an unpublished `@prettier-ai/dsh` and a
  * missing `prettier-ai/<version>` tracking tag as absent (return false), not
- * as a crash. npm 404 / E404 / 404 Not Found / `npm error code E404` all mean
- * missing. `git ls-remote --exit-code` statuses 1 and 2 mean the tag is
- * absent. Git HTTPS does not accept a Bearer extraheader; a token is sent as
- * Basic `x-access-token` (the same form actions/checkout uses). If that auth
- * still fails, the probe retries without credentials so a public repository
- * can answer "tag missing".
+ * as a crash. Registry existence is `GET
+ * https://registry.npmjs.org/@prettier-ai%2fdsh/<version>`: HTTP 404 means
+ * missing. That avoids `npm view` CLI error-string matching. `git ls-remote
+ * --exit-code` statuses 1 and 2 mean the tag is absent. Git HTTPS does not
+ * accept a Bearer extraheader; a token is sent as Basic `x-access-token` (the
+ * same form actions/checkout uses). If that auth still fails, the probe retries
+ * without credentials so a public repository can answer "tag missing".
  */
 
 import { spawnSync } from 'node:child_process'
@@ -50,7 +51,7 @@ export interface ProbeRequest {
 /** Collaborators the probe uses to read GitHub, npm, and this repository's tags. */
 export interface ProbeDependencies {
   readonly fetchJson: (url: string) => Promise<unknown>
-  readonly npmHasVersion: (name: string, version: string) => boolean
+  readonly npmHasVersion: (name: string, version: string) => boolean | Promise<boolean>
   readonly gitHasTag: (tag: string) => boolean
 }
 
@@ -100,18 +101,15 @@ export function isHttpNotFound(error: unknown): boolean {
 }
 
 /**
- * True when `npm view` output means the package or version is unpublished.
- * @param output - combined stdout and stderr from `npm view`.
- * @returns True for npm 404 / E404 / 404 Not Found / `npm error code E404`.
+ * Registry URL for one exact package version (scoped names use `%2f`).
+ * @param name - package name, for example `@prettier-ai/dsh`.
+ * @param version - exact version.
+ * @param registry - npm registry origin.
+ * @returns `https://registry.npmjs.org/@prettier-ai%2fdsh/<version>`.
  */
-export function npmViewIndicatesMissing(output: string): boolean {
-  const text = output.toLowerCase()
-  return (
-    text.includes('e404') ||
-    text.includes('404 not found') ||
-    text.includes('npm error code e404') ||
-    /\b404\b/.test(text)
-  )
+export function registryVersionUrl(name: string, version: string, registry = DEFAULT_REGISTRY): string {
+  const base = registry.endsWith('/') ? registry.slice(0, -1) : registry
+  return `${base}/${name.replaceAll('/', '%2f')}/${encodeURIComponent(version)}`
 }
 
 /**
@@ -162,7 +160,7 @@ export async function probeUpstreamRelease(request: ProbeRequest, deps: ProbeDep
     }
   }
   const version = await readUpstreamVersion(release.tag, deps)
-  if (deps.npmHasVersion(ENTRY_PACKAGE, version)) {
+  if (await deps.npmHasVersion(ENTRY_PACKAGE, version)) {
     return {
       action: 'skip',
       tag: release.tag,
@@ -283,22 +281,31 @@ function asContent(payload: unknown): string {
 }
 
 /**
- * `npm view` whether a version exists on the configured registry.
+ * Whether a version exists on the registry. Uses `GET /<name>/<version>`
+ * (HTTP 404 = unpublished / missing) instead of `npm view`, so the cheap probe
+ * does not depend on npm CLI error strings.
  * @param name - package name.
  * @param version - exact version.
  * @param registry - npm registry URL.
+ * @param fetchImpl - `fetch` (injected in tests).
  * @returns True when the registry has that version; false when it is unpublished.
  */
-export function npmHasVersion(name: string, version: string, registry = DEFAULT_REGISTRY): boolean {
-  const result = spawnSync(
-    'npm',
-    ['view', `${name}@${version}`, 'version', '--registry', registry, '--json'],
-    { encoding: 'utf8' },
-  )
-  if (result.status === 0) return true
-  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
-  if (npmViewIndicatesMissing(output)) return false
-  throw new Error(`npm view ${name}@${version} failed:\n${output}`)
+export async function npmHasVersion(
+  name: string,
+  version: string,
+  registry = DEFAULT_REGISTRY,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  const url = registryVersionUrl(name, version, registry)
+  const response = await fetchImpl(url, {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'prettier-ai-dsh-publisher',
+    },
+  })
+  if (response.status === 404) return false
+  if (response.ok) return true
+  throw new Error(`${url} failed: ${String(response.status)} ${response.statusText}`)
 }
 
 /**
@@ -405,5 +412,8 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  void main()
+  void main().catch((error: unknown) => {
+    console.error(error)
+    process.exit(1)
+  })
 }

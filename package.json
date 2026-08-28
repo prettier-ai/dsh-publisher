@@ -9,7 +9,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
-    "probe": "node scripts/probe-upstream-release.ts"
+    "probe": "node --experimental-strip-types scripts/probe-upstream-release.ts"
   },
   "engines": {
     "node": ">=22.6"
