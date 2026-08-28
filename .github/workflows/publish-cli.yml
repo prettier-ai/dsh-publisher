@@ -1,0 +1,182 @@
+# Pack and publish only `@prettier-ai/dsh`. Dispatch-only: no schedule.
+#
+# After the host-side `@deepseek-ai/*` compatibility layer lands, operators can
+# ship a new CLI tarball without republishing the vendor/dsh families (~230
+# packages). Use this when those workspace packages of the same version are
+# already on the registry.
+#
+# The job still fetches the official tag, rescopes the checkout, builds, packs
+# `apps/cli` only, injects the runtime loader and npm aliases into that tarball,
+# uploads it, and `npm publish`es it when NPM_TOKEN is set. It never calls
+# `release:pack --family` or `release:publish --family`.
+#
+# Versions still mirror the official release. This workflow does not invent a
+# publisher-side version suffix. If `@prettier-ai/dsh@<version>` is already on
+# npm with different contents (for example a Sync run published that version
+# before the compatibility inject), publish fails on integrity mismatch — wait
+# for a new official tag, or inspect the tarball on this run's artifacts.
+#
+# Optional input `tag`: empty uses the same probe as Sync (latest stable, else
+# newest non-draft including prereleases).
+#
+# Required secret: NPM_TOKEN (same as Sync). Missing token still packs and
+# uploads the CLI tarball, then skips npm publish. Never commit a token.
+#
+# This workflow does not push the prettier-ai/<version> tracking tag.
+name: Pack CLI / Publish CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream git tag (empty = latest stable, else newest non-draft including prereleases)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  # id-token: write lets npm attach provenance when the packed manifest requests it.
+  id-token: write
+
+concurrency:
+  group: publish-cli
+  cancel-in-progress: false
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+  UPSTREAM_REMOTE: https://github.com/deepseek-ai/deepseek-harness.git
+
+jobs:
+  decide:
+    name: Probe official release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.probe.outputs.tag }}
+      version: ${{ steps.probe.outputs.version }}
+      reason: ${{ steps.probe.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/probe-upstream-release.ts
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Probe
+        id: probe
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ -n "${INPUT_TAG}" ]]; then
+            extra+=(--tag "${INPUT_TAG}")
+          fi
+          if [[ ! -f scripts/probe-upstream-release.ts ]]; then
+            echo "sparse-checkout did not leave scripts/probe-upstream-release.ts on disk" >&2
+            ls -la . scripts 2>/dev/null || true
+            exit 1
+          fi
+          node --experimental-strip-types scripts/probe-upstream-release.ts --github-output "${extra[@]}"
+
+  pack:
+    name: Rescope, pack CLI, publish CLI
+    needs: decide
+    # Pack even when the probe would skip a full-family Sync (version already
+    # on npm): the artifact is still useful, and publish-cli-tarball.ts refuses
+    # to overwrite a different registry tarball.
+    if: needs.decide.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    env:
+      UPSTREAM_TAG: ${{ needs.decide.outputs.tag }}
+      VERSION: ${{ needs.decide.outputs.version }}
+      DECISION: ${{ needs.decide.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Fetch the official tag
+        run: |
+          set -euo pipefail
+          echo "probe decision: ${DECISION}"
+          git clone --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REMOTE}" upstream
+
+      - name: Copy the overlay scripts onto the official checkout
+        run: |
+          set -euo pipefail
+          cp scripts/rescope-to-prettier-ai.ts \
+             scripts/rescope-to-prettier-ai.spec.ts \
+             scripts/probe-upstream-release.ts \
+             scripts/probe-upstream-release.spec.ts \
+             scripts/inject-deepseek-ai-compat.ts \
+             scripts/inject-deepseek-ai-compat.spec.ts \
+             scripts/publish-cli-tarball.ts \
+             scripts/publish-cli-tarball.spec.ts \
+             upstream/scripts/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Apply the rescope to the official checkout
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/rescope-to-prettier-ai.ts --apply
+          node --experimental-strip-types scripts/rescope-to-prettier-ai.ts --check --applied
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: upstream/package.json
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - name: Install the rescoped workspace
+        working-directory: upstream
+        run: pnpm install --ignore-scripts
+
+      - name: Build official artifacts
+        working-directory: upstream
+        run: pnpm run build:official
+
+      - name: Pack only @prettier-ai/dsh
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          mkdir -p dist/npm-cli
+          pnpm --dir apps/cli pack --pack-destination "$(pwd)/dist/npm-cli"
+
+      - name: Inject @deepseek-ai/* compatibility into the CLI tarball
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --apply --from dist/npm-cli
+          node --experimental-strip-types scripts/inject-deepseek-ai-compat.ts --check --applied --from dist/npm-cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prettier-ai-dsh-cli-${{ needs.decide.outputs.version }}
+          path: upstream/dist/npm-cli/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish the CLI tarball when NPM_TOKEN is present
+        working-directory: upstream
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NPM_TOKEN}" ]]; then
+            echo "NPM_TOKEN is unset: the CLI tarball was uploaded as a workflow artifact; skipping npm publish."
+            echo "Add a repository secret NPM_TOKEN with publish access to the prettier-ai npm org, then re-run Pack CLI / Publish CLI."
+            exit 0
+          fi
+          export NODE_AUTH_TOKEN="${NPM_TOKEN}"
+          node --experimental-strip-types scripts/publish-cli-tarball.ts --from dist/npm-cli

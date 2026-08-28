@@ -8,7 +8,7 @@ Standalone publisher that republishes official [DeepSeek Harness](https://github
 
 - A poller: a scheduled workflow reads the official repository's latest GitHub Release and decides whether that version still needs a `@prettier-ai` publication.
 - A republisher: when a version is missing, the workflow fetches the official tag into the runner workspace, rewrites the packable package names from `@deepseek-ai/*` to `@prettier-ai/*` (a pack-only rewrite — no product renaming), then packs and publishes from that checkout.
-- Three scripts plus their unit tests: `scripts/probe-upstream-release.ts` (the decision), `scripts/rescope-to-prettier-ai.ts` (the rewrite), and `scripts/inject-deepseek-ai-compat.ts` (host-side `@deepseek-ai/*` compatibility on the packed CLI).
+- Overlay scripts plus their unit tests: `scripts/probe-upstream-release.ts` (the decision), `scripts/rescope-to-prettier-ai.ts` (the rewrite), `scripts/inject-deepseek-ai-compat.ts` (host-side `@deepseek-ai/*` compatibility on the packed CLI), and `scripts/publish-cli-tarball.ts` (integrity-safe publish of that CLI tarball only).
 
 ## What this repository is not
 
@@ -47,6 +47,10 @@ The rescope rewrites package manifests, shipped source specifiers, the lockfile,
 ### Manual dispatch
 
 Run the `Sync upstream release` workflow from the Actions tab (or `gh workflow run`). The optional `tag` input names an upstream git tag directly. Leave it empty to use the same latest-then-newest-non-draft selection as the schedule.
+
+### Pack CLI / Publish CLI
+
+`.github/workflows/publish-cli.yml` is dispatch-only (no schedule). It rescopes the same official tag, injects `@deepseek-ai/*` compatibility, packs **only** `@prettier-ai/dsh`, uploads that tarball, and publishes it when `NPM_TOKEN` is set. It does not pack or publish the vendor/dsh families. Use it when those workspace packages of that version are already on the registry and only the CLI tarball needs to ship. Versions still mirror the official release: this workflow does not invent a publisher-side suffix. If `@prettier-ai/dsh@<version>` is already on npm with different contents, publish fails — wait for a new official tag, and inspect the tarball on the run's artifacts.
 
 ### Tracking refs
 

@@ -8,7 +8,7 @@
 
 - 一个轮询器：定时 workflow 读取官方仓库最新的 GitHub Release，判断该版本是否仍需要发布到 `@prettier-ai`。
 - 一个重发布器：当版本缺失时，workflow 将官方 tag 拉取到 runner 工作区，把可发布包名从 `@deepseek-ai/*` 改写为 `@prettier-ai/*`（仅针对打包路径的改写，不做产品改名），然后在该检出上打包并发布。
-- 三个脚本及其单元测试：`scripts/probe-upstream-release.ts`（决策）、`scripts/rescope-to-prettier-ai.ts`（改写）和 `scripts/inject-deepseek-ai-compat.ts`（打包后 CLI 上的宿主侧 `@deepseek-ai/*` 兼容）。
+- Overlay 脚本及其单元测试：`scripts/probe-upstream-release.ts`（决策）、`scripts/rescope-to-prettier-ai.ts`（改写）、`scripts/inject-deepseek-ai-compat.ts`（打包后 CLI 上的宿主侧 `@deepseek-ai/*` 兼容）和 `scripts/publish-cli-tarball.ts`（仅发布该 CLI tarball，且按完整性跳过或拒绝覆盖）。
 
 ## 本仓库不是什么
 
@@ -47,6 +47,10 @@
 ### 手动触发
 
 在 Actions 页（或用 `gh workflow run`）运行 `Sync upstream release` workflow。可选的 `tag` 输入直接指定上游 git tag。留空时与定时任务相同：先取非预发布 latest，否则取最新的非草稿 Release（含预发布）。
+
+### Pack CLI / Publish CLI
+
+`.github/workflows/publish-cli.yml` 仅手动触发（无定时）。它会对同一官方 tag 做 rescope、注入 `@deepseek-ai/*` 兼容层、**只**打包 `@prettier-ai/dsh`、上传该 tarball，并在设置了 `NPM_TOKEN` 时发布。它不会打包或发布 vendor/dsh 家族。适用于该版本的 workspace 包已在 registry、只需补发 CLI tarball 的情况。版本号仍与官方一致：本 workflow 不会自造后缀。若 `@prettier-ai/dsh@<version>` 已在 npm 且内容不同，发布会失败——请等待新的官方 tag，并在本次 run 的 artifacts 中查看 tarball。
 
 ### 跟踪引用
 

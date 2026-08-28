@@ -122,6 +122,8 @@ jobs:
              scripts/probe-upstream-release.spec.ts \
              scripts/inject-deepseek-ai-compat.ts \
              scripts/inject-deepseek-ai-compat.spec.ts \
+             scripts/publish-cli-tarball.ts \
+             scripts/publish-cli-tarball.spec.ts \
              upstream/scripts/
 
       - uses: actions/setup-node@v6
