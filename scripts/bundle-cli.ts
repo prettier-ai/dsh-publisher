@@ -12,13 +12,19 @@
  * `pnpm deploy` hard-links files from the content-addressable store. GNU tar
  * would store those as hard-link members, and npm then rejects the PUT with
  * `E415 Hard link is not allowed`. Pack with `--hard-dereference` so each
- * member is a regular file. Keep `@deepseek-ai/*` symlinks (not hard links).
+ * member is a regular file.
+ *
+ * Pack CLI #5 then failed the same PUT with `E415 Symbolic link is not
+ * allowed`: `@deepseek-ai/*` aliases were relative symlinks, and leftover
+ * `.bin` links are also symlink members. Copy those aliases as real
+ * directories and pack with `--dereference` so remaining symlink members
+ * become regular files too.
  *
  * The packed bin stays `dsh` at `lib/bin.js`. This script does not add `dshp`.
  * Host-side `@deepseek-ai/*` compatibility is applied to the deploy directory
  * (runtime loader) before packing. Install-time npm aliases are not written:
  * they would put `@prettier-ai/*` back on `dependencies`. Physical
- * `@deepseek-ai/*` symlinks inside bundled `node_modules` cover profile
+ * `@deepseek-ai/*` directories inside bundled `node_modules` cover profile
  * `resolve.paths` instead.
  *
  * Usage:
@@ -28,14 +34,15 @@
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
+  cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
-  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -163,9 +170,10 @@ export function assertBundledCliManifest(manifest: Readonly<Record<string, unkno
 }
 
 /**
- * Create `node_modules/@deepseek-ai/<name>` relative symlinks for each
- * `node_modules/@prettier-ai/<name>` so profile `resolve.paths` still finds
- * official-scope directories without npm aliases on the published manifest.
+ * Copy `node_modules/@prettier-ai/<name>` to `node_modules/@deepseek-ai/<name>`
+ * as a real directory so profile `resolve.paths` still finds official-scope
+ * packages without npm aliases on the published manifest. Leftover relative
+ * symlinks are replaced: npm publish rejects symlink members with E415.
  * @param nodeModulesDir - bundled `node_modules`.
  */
 export function materializeDeepseekAiAliases(nodeModulesDir: string): readonly string[] {
@@ -177,8 +185,9 @@ export function materializeDeepseekAiAliases(nodeModulesDir: string): readonly s
   for (const name of readdirSync(prettierScope).sort()) {
     if (name === '.' || name === '..') continue
     const dest = join(deepseekScope, name)
-    if (existsSync(dest)) continue
-    symlinkSync(join('..', '@prettier-ai', name), dest)
+    if (isSymbolicLink(dest)) unlinkSync(dest)
+    else if (existsSync(dest)) continue
+    cpSync(join(prettierScope, name), dest, { recursive: true, dereference: true })
     created.push(`@deepseek-ai/${name}`)
   }
   return created
@@ -212,8 +221,8 @@ export function packBundledDirectory(packageDir: string, outDir: string): Packed
     const parent = join(tmp, 'parent')
     mkdirSync(parent)
     execFileSync('cp', ['-a', packageDir, join(parent, 'package')])
-    // --hard-dereference: npm rejects tar hard-link members (E415). Keep symlinks.
-    execFileSync('tar', ['--hard-dereference', '-czf', file, '-C', parent, 'package'])
+    // npm rejects tar hard-link members and symlink members (both E415).
+    execFileSync('tar', ['--hard-dereference', '--dereference', '-czf', file, '-C', parent, 'package'])
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -227,6 +236,9 @@ export function packBundledDirectory(packageDir: string, outDir: string): Packed
   }
   if (tarballHasHardLinks(file)) {
     throw new Error('bundle-cli: packed tarball contains hard links; npm publish rejects those with E415')
+  }
+  if (tarballHasSymlinks(file)) {
+    throw new Error('bundle-cli: packed tarball contains symbolic links; npm publish rejects those with E415')
   }
   return { name: packed.name, version: packed.version, file }
 }
@@ -366,6 +378,14 @@ function readPackedIdentity(tarball: string): { name: string; version: string } 
   return { name, version }
 }
 
+function isSymbolicLink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
 function pipeTarGrep(tarball: string, script: string, argv0: string, extraArgs: readonly string[] = []): boolean {
   const result = spawnSync(
     'sh',
@@ -408,6 +428,19 @@ export function tarballHasHardLinks(tarball: string): boolean {
     tarball,
     'tar -tvf "$1" | grep -F -m1 -- " link to " >/dev/null',
     'tarball-has-hard-links',
+  )
+}
+
+/**
+ * Whether GNU tar stored any symbolic-link members (type `l`).
+ * npm publish rejects those with HTTP 415 (`Symbolic link is not allowed`).
+ * @param tarball - path to a `.tgz`.
+ */
+export function tarballHasSymlinks(tarball: string): boolean {
+  return pipeTarGrep(
+    tarball,
+    'tar -tvf "$1" | grep -E -m1 -- "^l" >/dev/null',
+    'tarball-has-symlinks',
   )
 }
 
