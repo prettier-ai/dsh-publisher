@@ -1,5 +1,15 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -20,6 +30,7 @@ import {
   scopedWorkspaceDependencyNames,
   tarballHasHardLinks,
   tarballHasPathPrefix,
+  tarballHasSymlinks,
 } from './bundle-cli.ts'
 
 const VERSION = '0.1.2-alpha.1'
@@ -175,11 +186,24 @@ describe('packBundledDirectory', () => {
     const listing = execFileSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
     expect(listing).toContain('package/node_modules/@prettier-ai/cordis/package.json')
     expect(listing).toContain('package/node_modules/@prettier-ai/dsh-client-ui-conversation/package.json')
-    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis')
+    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis/package.json')
     expect(listing).toContain('package/lib/bin.js')
     expect(listing).toContain('package/lib/bin.upstream.js')
     expect(listing).toContain('package/lib/deepseek-ai-compat-loader.js')
     expect(tarballHasHardLinks(packed.file)).toBe(false)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
+
+    const aliasManifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/node_modules/@deepseek-ai/cordis/package.json'], {
+        encoding: 'utf8',
+      }),
+    ) as { name: string }
+    expect(aliasManifest.name).toBe('@prettier-ai/cordis')
+    const requireFromBundle = createRequire(join(packageDir, 'package.json'))
+    expect(requireFromBundle.resolve('@deepseek-ai/cordis/package.json')).toBe(
+      join(packageDir, 'node_modules/@deepseek-ai/cordis/package.json'),
+    )
+    expect(lstatSync(join(packageDir, 'node_modules/@deepseek-ai/cordis')).isSymbolicLink()).toBe(false)
 
     const wrapper = execFileSync('tar', ['-xOzf', packed.file, 'package/lib/bin.js'], { encoding: 'utf8' })
     expect(wrapper).toContain(DEEPSEEK_AI_COMPAT_MARKER)
@@ -210,10 +234,30 @@ describe('packBundledDirectory', () => {
     const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-hardlink-out-'))
     const packed = packBundledDirectory(packageDir, out)
     expect(tarballHasHardLinks(packed.file)).toBe(false)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
     const listing = execFileSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
     expect(listing).toContain('package/node_modules/dup-a.js')
     expect(listing).toContain('package/node_modules/dup-b.js')
-    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis')
+    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis/package.json')
+  })
+
+  it('stores leftover .bin and @deepseek-ai members as regular files so npm will not E415', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-symlink-'))
+    writeDeployFixture(packageDir)
+    mkdirSync(join(packageDir, 'node_modules/.bin'), { recursive: true })
+    symlinkSync('../commander/package.json', join(packageDir, 'node_modules/.bin/commander'))
+    mkdirSync(join(packageDir, 'node_modules/@deepseek-ai'), { recursive: true })
+    symlinkSync('../@prettier-ai/cordis', join(packageDir, 'node_modules/@deepseek-ai/cordis'))
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-symlink-out-'))
+    const packed = packBundledDirectory(packageDir, out)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
+    const listing = execFileSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
+    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis/package.json')
+    expect(listing).toContain('package/node_modules/.bin/commander')
+    const verbose = execFileSync('tar', ['-tvf', packed.file], { encoding: 'utf8' })
+    expect(verbose.split('\n').some(line => line.startsWith('l'))).toBe(false)
+    expect(lstatSync(join(packageDir, 'node_modules/@deepseek-ai/cordis')).isSymbolicLink()).toBe(false)
   })
 
   it('packs a deploy tree whose tar listing exceeds Node spawnSync maxBuffer', () => {
@@ -226,6 +270,7 @@ describe('packBundledDirectory', () => {
     expect(raw.error).toMatchObject({ code: 'ENOBUFS' })
     expect(tarballHasPathPrefix(packed.file, 'package/node_modules/')).toBe(true)
     expect(tarballHasHardLinks(packed.file)).toBe(false)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
     expect(() => checkAppliedCompat(out)).not.toThrow()
   })
 })
@@ -259,17 +304,61 @@ describe('tarballHasHardLinks', () => {
   })
 })
 
+describe('tarballHasSymlinks', () => {
+  it('detects GNU tar symlink members that --hard-dereference leaves in place', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-sl-'))
+    const packageDir = join(root, 'package')
+    mkdirSync(join(packageDir, 'node_modules/@prettier-ai/cordis'), { recursive: true })
+    mkdirSync(join(packageDir, 'node_modules/@deepseek-ai'), { recursive: true })
+    writeFileSync(join(packageDir, 'node_modules/@prettier-ai/cordis/package.json'), '{"name":"@prettier-ai/cordis"}\n')
+    symlinkSync('../@prettier-ai/cordis', join(packageDir, 'node_modules/@deepseek-ai/cordis'))
+    const withLinks = join(root, 'with-symlinks.tgz')
+    execFileSync('tar', ['--hard-dereference', '-czf', withLinks, '-C', root, 'package'])
+    expect(tarballHasSymlinks(withLinks)).toBe(true)
+    expect(tarballHasHardLinks(withLinks)).toBe(false)
+    const listing = execFileSync('tar', ['-tzf', withLinks], { encoding: 'utf8' })
+    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis')
+    expect(listing).not.toContain('package/node_modules/@deepseek-ai/cordis/package.json')
+    const flattened = join(root, 'flattened.tgz')
+    execFileSync('tar', ['--hard-dereference', '--dereference', '-czf', flattened, '-C', root, 'package'])
+    expect(tarballHasSymlinks(flattened)).toBe(false)
+    expect(execFileSync('tar', ['-tzf', flattened], { encoding: 'utf8' })).toContain(
+      'package/node_modules/@deepseek-ai/cordis/package.json',
+    )
+  })
+})
+
 describe('materializeDeepseekAiAliases', () => {
-  it('symlinks each @prettier-ai package under @deepseek-ai', () => {
+  it('copies each @prettier-ai package under @deepseek-ai as a real directory', () => {
     const nodeModules = join(mkdtempSync(join(tmpdir(), 'dsh-bundle-alias-')), 'node_modules')
     mkdirSync(join(nodeModules, '@prettier-ai/cordis'), { recursive: true })
     mkdirSync(join(nodeModules, '@prettier-ai/dsh-settings'), { recursive: true })
+    writeFileSync(join(nodeModules, '@prettier-ai/cordis/package.json'), '{"name":"@prettier-ai/cordis"}\n')
+    writeFileSync(join(nodeModules, '@prettier-ai/dsh-settings/package.json'), '{"name":"@prettier-ai/dsh-settings"}\n')
     expect([...materializeDeepseekAiAliases(nodeModules)]).toEqual([
       '@deepseek-ai/cordis',
       '@deepseek-ai/dsh-settings',
     ])
-    expect(readlinkSync(join(nodeModules, '@deepseek-ai/cordis'))).toBe('../@prettier-ai/cordis')
+    expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isSymbolicLink()).toBe(false)
+    expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isDirectory()).toBe(true)
+    expect(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8')).toBe(
+      '{"name":"@prettier-ai/cordis"}\n',
+    )
     expect(materializeDeepseekAiAliases(nodeModules)).toEqual([])
+  })
+
+  it('replaces a leftover @deepseek-ai symlink with a real directory', () => {
+    const nodeModules = join(mkdtempSync(join(tmpdir(), 'dsh-bundle-alias-rel-')), 'node_modules')
+    mkdirSync(join(nodeModules, '@prettier-ai/cordis'), { recursive: true })
+    mkdirSync(join(nodeModules, '@deepseek-ai'), { recursive: true })
+    writeFileSync(join(nodeModules, '@prettier-ai/cordis/package.json'), '{"name":"@prettier-ai/cordis"}\n')
+    symlinkSync('../@prettier-ai/cordis', join(nodeModules, '@deepseek-ai/cordis'))
+    expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isSymbolicLink()).toBe(true)
+    expect([...materializeDeepseekAiAliases(nodeModules)]).toEqual(['@deepseek-ai/cordis'])
+    expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isSymbolicLink()).toBe(false)
+    expect(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8')).toBe(
+      '{"name":"@prettier-ai/cordis"}\n',
+    )
   })
 })
 
