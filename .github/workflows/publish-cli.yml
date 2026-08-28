@@ -19,19 +19,21 @@
 # `release:pack --family` or `release:publish --family`.
 #
 # Source git tag is still the official tag from `tag` / the probe. Optional
-# input `suffix` is the standing testing knob so the same official tag can be
-# packed many times: empty keeps the official npm version; non-empty publishes
-# `{officialVersion}-{suffix}` (example: `0.1.1-rc.2` + `bundle.1` →
-# `0.1.1-rc.2-bundle.1`) for `@prettier-ai/dsh` and `@prettier-ai/dshp` only.
-# The operator types the suffix each run; this workflow does not auto-increment
-# or invent a suffix when the input is empty. Suffixed versions always contain
-# `-` and therefore `npm publish --tag next` (including a suffix on a stable
-# official version such as `0.1.1-bundle.1`). Sync upstream release stays
-# suffix-free. If `@prettier-ai/dsh@<published-version>` is already on npm with
-# different contents, CLI publish fails on integrity mismatch — pass a new
-# suffix, wait for a new official tag, or inspect the tarball on this run's
-# artifacts. `@prettier-ai/dshp` still publishes in that case when it is absent
-# from npm; it does not overwrite `@prettier-ai/dsh`.
+# input `npm_version` is an operator override for a burned registry
+# name@version (npm never reuses it after publish). Empty keeps the official
+# probe version. When set, that exact string is the published version for the
+# bundled CLI and dshp — it is not a suffix and is not auto-appended. Example:
+# `tag` `dsh-v0.1.1-rc.2` + `npm_version` `0.1.1-rc.2-bundle.1` publishes
+# `@prettier-ai/dsh@0.1.1-rc.2-bundle.1` and `@prettier-ai/dshp@0.1.1-rc.2-bundle.1`
+# while leaving `0.1.1-rc.2` on the registry. Optional `suffix` still joins as
+# `{official}-{suffix}` when `npm_version` is empty; if both are set,
+# `npm_version` wins. Versions containing `-` use `npm publish --tag next` and
+# do not move `latest`. Sync upstream release stays override-free. If
+# `@prettier-ai/dsh@<published-version>` is already on npm with different
+# contents, CLI publish fails on integrity mismatch — pass a new unpublished
+# `npm_version`, wait for a new official tag, or inspect the tarball on this
+# run's artifacts. `@prettier-ai/dshp` still publishes in that case when it is
+# absent from npm; it does not overwrite `@prettier-ai/dsh`.
 #
 # Optional input `tag`: empty uses the same probe as Sync (latest stable, else
 # newest non-draft including prereleases).
@@ -50,7 +52,11 @@ on:
         required: false
         type: string
       suffix:
-        description: 'Optional npm prerelease suffix joined with a hyphen (e.g. bundle.1 → 0.1.1-rc.2-bundle.1). Empty = official version. Does not move latest.'
+        description: 'Optional npm prerelease suffix joined with a hyphen (e.g. bundle.1 → 0.1.1-rc.2-bundle.1). Empty = official version. Ignored when npm_version is set. Does not move latest.'
+        required: false
+        type: string
+      npm_version:
+        description: 'Optional published npm version override (e.g. 0.1.1-rc.2-bundle.1 while tag is dsh-v0.1.1-rc.2). Empty = official probe version. Does not unpublish or reuse a burned name@version. Wins over suffix when both are set. Does not move latest.'
         required: false
         type: string
 
@@ -111,8 +117,9 @@ jobs:
     needs: decide
     # Pack even when the probe would skip a full-family Sync (version already
     # on npm): the artifact is still useful, and publish-cli-tarball.ts refuses
-    # to overwrite a different registry tarball. An operator-supplied suffix
-    # publishes a new npm version for the same official tag. dshp can still ship.
+    # to overwrite a different registry tarball. npm_version (or suffix) publishes
+    # a new npm version for the same official tag without unpublishing. dshp can
+    # still ship.
     if: needs.decide.outputs.tag != ''
     runs-on: ubuntu-24.04
     env:
@@ -148,9 +155,10 @@ jobs:
         id: publish-version
         env:
           SUFFIX: ${{ inputs.suffix }}
+          NPM_VERSION: ${{ inputs.npm_version }}
         run: |
           set -euo pipefail
-          published="$(node --experimental-strip-types scripts/bundle-cli.ts --published-version --official "${VERSION}" --suffix "${SUFFIX:-}")"
+          published="$(node --experimental-strip-types scripts/bundle-cli.ts --published-version --official "${VERSION}" --suffix "${SUFFIX:-}" --npm-version "${NPM_VERSION:-}")"
           echo "version=${published}" >> "${GITHUB_OUTPUT}"
           echo "PUBLISHED_VERSION=${published}" >> "${GITHUB_ENV}"
           echo "official version: ${VERSION}"

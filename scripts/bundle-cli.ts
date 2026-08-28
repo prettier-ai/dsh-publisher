@@ -37,7 +37,7 @@
  * Usage:
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm-cli
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm --replace
- *   node --experimental-strip-types scripts/bundle-cli.ts --published-version --official <ver> [--suffix <id>]
+ *   node --experimental-strip-types scripts/bundle-cli.ts --published-version --official <ver> [--suffix <id>] [--npm-version <ver>]
  */
 
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -145,6 +145,37 @@ export function publishedNpmVersion(officialVersion: string, suffix: string | un
     throw new Error(`bundle-cli: ${JSON.stringify(version)} is not a valid npm version`)
   }
   return version
+}
+
+/** Options for resolving the published CLI / dshp npm version. */
+export interface ResolvePublishedVersionOptions {
+  readonly npmVersion?: string | undefined
+  readonly suffix?: string | undefined
+}
+
+/**
+ * Resolve the npm version stamped on the packed CLI and dshp.
+ * `npmVersion` is an exact override (e.g. `0.1.1-rc.2-bundle.1` for a burned
+ * registry version). It is not a suffix and is not auto-appended to official.
+ * When `npmVersion` is empty, `suffix` joins as `{official}-{suffix}`.
+ * @param officialVersion - version from the official git tag / probe.
+ * @param options - optional `npm_version` and `suffix` workflow inputs.
+ */
+export function resolvePublishedVersion(
+  officialVersion: string,
+  options: ResolvePublishedVersionOptions = {},
+): string {
+  const npmVersion = options.npmVersion
+  if (npmVersion !== undefined && npmVersion !== '') {
+    if (npmVersion.trim() !== npmVersion || /\s/.test(npmVersion) || npmVersion.includes('/')) {
+      throw new Error('bundle-cli: npm_version must not contain whitespace or slashes')
+    }
+    if (!isNpmVersion(npmVersion)) {
+      throw new Error(`bundle-cli: npm_version ${JSON.stringify(npmVersion)} is not a valid npm version`)
+    }
+    return npmVersion
+  }
+  return publishedNpmVersion(officialVersion, options.suffix)
 }
 
 /**
@@ -760,6 +791,7 @@ function main(): void {
       version: { type: 'string' },
       official: { type: 'string' },
       suffix: { type: 'string' },
+      'npm-version': { type: 'string' },
       'published-version': { type: 'boolean', default: false },
     },
     allowPositionals: false,
@@ -769,7 +801,10 @@ function main(): void {
     if (official === undefined || official === '') {
       throw new Error('bundle-cli: --published-version requires --official')
     }
-    process.stdout.write(`${publishedNpmVersion(official, values.suffix)}\n`)
+    process.stdout.write(`${resolvePublishedVersion(official, {
+      npmVersion: values['npm-version'],
+      suffix: values.suffix,
+    })}\n`)
     return
   }
   const workspace = values.workspace

@@ -31,6 +31,7 @@ import {
   prettierAiDshStarDependencyNames,
   publishedNpmVersion,
   removePackedCliTarballs,
+  resolvePublishedVersion,
   scopedWorkspaceDependencyNames,
   tarballHasHardLinks,
   tarballHasPathPrefix,
@@ -176,6 +177,32 @@ describe('publishedNpmVersion', () => {
     expect(() => publishedNpmVersion('0.1.1', 'bundle/1')).toThrow(/whitespace or slashes/)
     expect(() => publishedNpmVersion('0.1.1', '-bundle.1')).toThrow(/prerelease identifier/)
     expect(() => publishedNpmVersion('0.1.1', 'bundle..1')).toThrow(/prerelease identifier/)
+  })
+})
+
+describe('resolvePublishedVersion', () => {
+  it('keeps the official version when npm_version and suffix are empty', () => {
+    expect(resolvePublishedVersion('0.1.1-rc.2', {})).toBe('0.1.1-rc.2')
+    expect(resolvePublishedVersion('0.1.1-rc.2', { npmVersion: '', suffix: '' })).toBe('0.1.1-rc.2')
+    expect(resolvePublishedVersion('0.1.1-rc.2', { npmVersion: undefined, suffix: undefined })).toBe('0.1.1-rc.2')
+  })
+
+  it('uses npm_version as the exact published identity without appending a suffix', () => {
+    expect(resolvePublishedVersion('0.1.1-rc.2', { npmVersion: '0.1.1-rc.2-bundle.1' })).toBe('0.1.1-rc.2-bundle.1')
+    expect(resolvePublishedVersion('0.1.1-rc.2', {
+      npmVersion: '0.1.1-rc.2-bundle.1',
+      suffix: 'test.2',
+    })).toBe('0.1.1-rc.2-bundle.1')
+  })
+
+  it('falls back to suffix join when npm_version is empty', () => {
+    expect(resolvePublishedVersion('0.1.1-rc.2', { suffix: 'bundle.1' })).toBe('0.1.1-rc.2-bundle.1')
+  })
+
+  it('rejects invalid npm_version overrides', () => {
+    expect(() => resolvePublishedVersion('0.1.1-rc.2', { npmVersion: '  ' })).toThrow(/whitespace or slashes/)
+    expect(() => resolvePublishedVersion('0.1.1-rc.2', { npmVersion: 'bundle.1' })).toThrow(/valid npm version/)
+    expect(() => resolvePublishedVersion('0.1.1-rc.2', { npmVersion: '0.1.1-rc.2/bundle.1' })).toThrow(/whitespace or slashes/)
   })
 })
 
@@ -327,6 +354,30 @@ describe('packBundledDirectory', () => {
     const wrapper = execFileSync('tar', ['-xOzf', packed.file, 'package/lib/bin.js'], { encoding: 'utf8' })
     expect(wrapper).toContain(DEEPSEEK_AI_COMPAT_MARKER)
     expect(() => checkAppliedCompat(out)).not.toThrow()
+  })
+
+  it('keeps the official packed identity when no version override is set', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-official-'))
+    writeDeployFixture(packageDir)
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-official-out-'))
+    const packed = packBundledDirectory(packageDir, out)
+    expect(packed.version).toBe(VERSION)
+    expect(packed.file).toBe(join(out, `prettier-ai-dsh-${VERSION}.tgz`))
+  })
+
+  it('rewrites only the packed CLI version when npm_version is set', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-npmver-'))
+    writeDeployFixture(packageDir)
+    const published = '0.1.1-rc.2-bundle.1'
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-npmver-out-'))
+    const packed = packBundledDirectory(packageDir, out, { version: published })
+    expect(packed.version).toBe(published)
+    expect(packed.file).toBe(join(out, `prettier-ai-dsh-${published}.tgz`))
+    const manifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/package.json'], { encoding: 'utf8' }),
+    ) as { version: string; dependencies?: Record<string, string> }
+    expect(manifest.version).toBe(published)
+    expect(manifest.dependencies).toBeUndefined()
   })
 
   it('does not put @prettier-ai/dsh-* back when the compatibility inject runs', () => {
@@ -548,6 +599,17 @@ describe('workflows', () => {
     expect(cli).toContain('publish-dshp.ts --pack --version "${PUBLISHED_VERSION}"')
     expect(sync).not.toMatch(/^\s+suffix:\s*$/m)
     expect(sync).not.toContain('--published-version')
+  })
+
+  it('documents npm_version override for a burned registry version and keeps Sync free of it', () => {
+    const sync = readFileSync(new URL('../.github/workflows/sync-upstream-release.yml', import.meta.url), 'utf8')
+    const cli = readFileSync(new URL('../.github/workflows/publish-cli.yml', import.meta.url), 'utf8')
+    expect(cli).toMatch(/^\s+npm_version:\s*$/m)
+    expect(cli).toContain('0.1.1-rc.2-bundle.1')
+    expect(cli).toContain('dsh-v0.1.1-rc.2')
+    expect(cli).toContain('--npm-version')
+    expect(sync).not.toMatch(/^\s+npm_version:\s*$/m)
+    expect(sync).not.toContain('npm_version')
   })
 })
 
