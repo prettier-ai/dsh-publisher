@@ -89,6 +89,36 @@ function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, stri
     name: 'commander',
     version: '15.0.0',
   }, null, 2)}\n`)
+  mkdirSync(join(packageDir, 'node_modules/@prettier-ai/dsh-client-modules/lib'), { recursive: true })
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/dsh-client-modules/package.json'),
+    `${JSON.stringify({
+      name: '@prettier-ai/dsh-client-modules',
+      version: VERSION,
+      dsh: { client: { inject: ['@prettier-ai/dsh-client-runtime'] } },
+    }, null, 2)}\n`,
+  )
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/dsh-client-modules/lib/index.js'),
+    [
+      'export const CLIENT_MODULES_ID = "@prettier-ai/dsh-client-modules"',
+      'export const CLIENT_RUNTIME_ID = "@prettier-ai/dsh-client-runtime"',
+      '',
+    ].join('\n'),
+  )
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),
+    'window.__ModuleLoader__.load({ id: "@prettier-ai/dsh-client-modules" })\n',
+  )
+  mkdirSync(join(packageDir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets'), { recursive: true })
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/dsh-web-frontend/package.json'),
+    `${JSON.stringify({ name: '@prettier-ai/dsh-web-frontend', version: VERSION }, null, 2)}\n`,
+  )
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'),
+    'const PLATFORM_MODULES = { "@prettier-ai/dsh-client-modules": true }\n',
+  )
 }
 
 /** Enough long-named members that `tar -tzf` stdout exceeds Node's 1 MiB maxBuffer. */
@@ -433,7 +463,51 @@ describe('packBundledDirectory', () => {
         encoding: 'utf8',
       }),
     ) as { name: string }
-    expect(aliasManifest.name).toBe('@prettier-ai/cordis')
+    expect(aliasManifest.name).toBe('@deepseek-ai/cordis')
+    const publishedCordis = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/cordis/package.json'], {
+        encoding: 'utf8',
+      }),
+    ) as { name: string }
+    expect(publishedCordis.name).toBe('@prettier-ai/cordis')
+    const publishedModules = JSON.parse(
+      execFileSync(
+        'tar',
+        ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/package.json'],
+        { encoding: 'utf8' },
+      ),
+    ) as { name: string; dsh: { client: { inject: string[] } } }
+    expect(publishedModules.name).toBe('@prettier-ai/dsh-client-modules')
+    expect(publishedModules.dsh.client.inject).toEqual(['@deepseek-ai/dsh-client-runtime'])
+    const aliasModules = JSON.parse(
+      execFileSync(
+        'tar',
+        ['-xOzf', packed.file, 'package/node_modules/@deepseek-ai/dsh-client-modules/package.json'],
+        { encoding: 'utf8' },
+      ),
+    ) as { name: string }
+    expect(aliasModules.name).toBe('@deepseek-ai/dsh-client-modules')
+    const modulesIndex = execFileSync(
+      'tar',
+      ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/lib/index.js'],
+      { encoding: 'utf8' },
+    )
+    expect(modulesIndex).toContain('@deepseek-ai/dsh-client-modules')
+    expect(modulesIndex).not.toContain('@prettier-ai/dsh-client-modules')
+    const modulesClient = execFileSync(
+      'tar',
+      ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'],
+      { encoding: 'utf8' },
+    )
+    expect(modulesClient).toContain('@deepseek-ai/dsh-client-modules')
+    expect(modulesClient).not.toContain('@prettier-ai/')
+    const frontendAsset = execFileSync(
+      'tar',
+      ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'],
+      { encoding: 'utf8' },
+    )
+    expect(frontendAsset).toContain('@deepseek-ai/dsh-client-modules')
+    expect(frontendAsset).not.toContain('@prettier-ai/')
     const requireFromBundle = createRequire(join(packageDir, 'package.json'))
     expect(requireFromBundle.resolve('@deepseek-ai/cordis/package.json')).toBe(
       join(packageDir, 'node_modules/@deepseek-ai/cordis/package.json'),
@@ -652,9 +726,12 @@ describe('materializeDeepseekAiAliases', () => {
     ])
     expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isSymbolicLink()).toBe(false)
     expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isDirectory()).toBe(true)
-    expect(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8')).toBe(
-      '{"name":"@prettier-ai/cordis"}\n',
-    )
+    expect(JSON.parse(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8'))).toEqual({
+      name: '@deepseek-ai/cordis',
+    })
+    expect(JSON.parse(readFileSync(join(nodeModules, '@prettier-ai/cordis/package.json'), 'utf8'))).toEqual({
+      name: '@prettier-ai/cordis',
+    })
     expect(materializeDeepseekAiAliases(nodeModules)).toEqual([])
   })
 
@@ -667,9 +744,23 @@ describe('materializeDeepseekAiAliases', () => {
     expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isSymbolicLink()).toBe(true)
     expect([...materializeDeepseekAiAliases(nodeModules)]).toEqual(['@deepseek-ai/cordis'])
     expect(lstatSync(join(nodeModules, '@deepseek-ai/cordis')).isSymbolicLink()).toBe(false)
-    expect(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8')).toBe(
-      '{"name":"@prettier-ai/cordis"}\n',
-    )
+    expect(JSON.parse(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8'))).toEqual({
+      name: '@deepseek-ai/cordis',
+    })
+  })
+
+  it('stamps name on an existing real alias directory without recopying', () => {
+    const nodeModules = join(mkdtempSync(join(tmpdir(), 'dsh-bundle-alias-exist-')), 'node_modules')
+    mkdirSync(join(nodeModules, '@prettier-ai/cordis'), { recursive: true })
+    mkdirSync(join(nodeModules, '@deepseek-ai/cordis'), { recursive: true })
+    writeFileSync(join(nodeModules, '@prettier-ai/cordis/package.json'), '{"name":"@prettier-ai/cordis"}\n')
+    writeFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), '{"name":"@prettier-ai/cordis"}\n')
+    writeFileSync(join(nodeModules, '@deepseek-ai/cordis/stale.js'), 'stale\n')
+    expect(materializeDeepseekAiAliases(nodeModules)).toEqual([])
+    expect(JSON.parse(readFileSync(join(nodeModules, '@deepseek-ai/cordis/package.json'), 'utf8'))).toEqual({
+      name: '@deepseek-ai/cordis',
+    })
+    expect(readFileSync(join(nodeModules, '@deepseek-ai/cordis/stale.js'), 'utf8')).toBe('stale\n')
   })
 })
 

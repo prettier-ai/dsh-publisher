@@ -19,15 +19,20 @@
  *   overlay must not vendor Harness sources. Wrapping the packed bin is the
  *   site we control.
  *
- * Two layers:
+ * Three layers:
  * 1. Runtime (required): a Node module hook registered from the CLI bin so
- *    `import '@deepseek-ai/cordis'` (and every other `@deepseek-ai/*`
- *    specifier) resolves to `@prettier-ai/cordis` from this installation.
- *    Host `@prettier-ai/*` specifiers (plugin names expanded from rescoped
- *    bundles) also resolve from this installation; official profiles only
- *    install `@deepseek-ai/*`. Third-party profile plugins stay in
+ *    `import '@deepseek-ai/cordis'` resolves from this installation. Official
+ *    `@deepseek-ai/*` specifiers try the physical CLI aliases first (so
+ *    client-modules can match Loader entry names against package.json `name`),
+ *    then the `@prettier-ai/*` copy. Host `@prettier-ai/*` specifiers also
+ *    resolve from this installation. Third-party profile plugins stay in
  *    `$DSH_HOME/profiles/<name>/node_modules`.
- * 2. Install-time: npm aliases `@deepseek-ai/<name>` →
+ * 2. Browser/plugin identity restore: rescope rewrites CLIENT_MODULES_ID,
+ *    tsdown client-bundle banners, Vite seed keys, and `dsh.client.inject` to
+ *    `@prettier-ai/*`. Official web profiles and third-party plugins still
+ *    name `@deepseek-ai/*`. After pack, those wire IDs are restored so HTML
+ *    parser-preloads match. npm package names stay `@prettier-ai/*`.
+ * 3. Install-time: npm aliases `@deepseek-ai/<name>` →
  *    `npm:@prettier-ai/<name>@<same range>` on each `@prettier-ai/*`
  *    dependency, so `healProfilesModuleFallback` and `resolve.paths` still
  *    find physical `@deepseek-ai/*` directories for existing profile manifests.
@@ -52,7 +57,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
@@ -78,6 +83,79 @@ export const DEEPSEEK_AI_COMPAT_MARKER = COMPAT_MARKER
 export function mapDeepseekAiSpecifier(specifier: string): string | undefined {
   if (!specifier.startsWith(FROM_SCOPE)) return undefined
   return `${TO_SCOPE}${specifier.slice(FROM_SCOPE.length)}`
+}
+
+/**
+ * Map a published-scope specifier back to the official plugin identity.
+ * Browser boot IDs, `dsh.client.inject`, and third-party plugins still use
+ * `@deepseek-ai/*`. npm package names on the `@prettier-ai` copies stay published-scope.
+ * @param specifier - a Node package specifier, including subpaths.
+ */
+export function officialPluginIdentity(specifier: string): string {
+  if (!specifier.startsWith(TO_SCOPE)) return specifier
+  return `${FROM_SCOPE}${specifier.slice(TO_SCOPE.length)}`
+}
+
+const CLIENT_MODULES_NAME = 'dsh-client-modules'
+const CLIENT_RUNTIME_NAME = 'dsh-client-runtime'
+const WIRE_IDENTITY_FROM = [
+  `${TO_SCOPE}${CLIENT_MODULES_NAME}`,
+  `${TO_SCOPE}${CLIENT_RUNTIME_NAME}`,
+] as const
+
+/**
+ * Restore official `@deepseek-ai/*` plugin identities inside packed CLI
+ * `node_modules` so HTML parser-preloads match official profile Loader names.
+ *
+ * Live failure: the inlined `__ModuleLoader__.create()` looks up
+ * `@prettier-ai/dsh-client-modules` while `__DSH_BOOT__.entries` and
+ * third-party `inject` still use `@deepseek-ai/*`. Host plugins then drop
+ * out of the boot graph (0.1.2 `nearestPackage` requires `name` === loader
+ * id), so the HTML never parser-preloads `client.js`.
+ * @param packageDir - unpacked CLI package directory.
+ * @returns Relative paths that changed.
+ */
+export function restoreOfficialPluginIdentities(packageDir: string): readonly string[] {
+  const nodeModules = join(packageDir, 'node_modules')
+  if (!existsSync(nodeModules)) return []
+  const changed: string[] = []
+  for (const packageRoot of collectScopedPackageDirs(nodeModules)) {
+    const rel = relative(packageDir, packageRoot).replaceAll('\\', '/')
+    const manifestPath = join(packageRoot, 'package.json')
+    const manifest = readManifest(manifestPath)
+    let manifestChanged = false
+    const name = typeof manifest.name === 'string' ? manifest.name : ''
+    if (isOfficialAliasDir(packageRoot) && name.startsWith(TO_SCOPE)) {
+      manifest.name = officialPluginIdentity(name)
+      manifestChanged = true
+    }
+    if (restoreDshClientIdentities(manifest)) manifestChanged = true
+    if (manifestChanged) {
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+      changed.push(`${rel}/package.json`)
+    }
+    const clientJs = join(packageRoot, 'lib/client.js')
+    if (restorePublishedScopeInFile(clientJs)) changed.push(`${rel}/lib/client.js`)
+    if (isWireIdentityPackage(name, packageRoot)) {
+      const libDir = join(packageRoot, 'lib')
+      if (existsSync(libDir)) {
+        for (const file of readdirSync(libDir)) {
+          if (!file.endsWith('.js') || file === 'client.js') continue
+          if (restoreWireIdsInFile(join(libDir, file))) changed.push(`${rel}/lib/${file}`)
+        }
+      }
+    }
+    const assetsDir = join(packageRoot, 'dist/assets')
+    if (existsSync(assetsDir)) {
+      for (const file of readdirSync(assetsDir)) {
+        if (!file.endsWith('.js')) continue
+        if (restorePublishedScopeInFile(join(assetsDir, file))) {
+          changed.push(`${rel}/dist/assets/${file}`)
+        }
+      }
+    }
+  }
+  return changed
 }
 
 /**
@@ -169,16 +247,21 @@ export function injectPackageDir(packageDir: string): InjectPackageResult {
   if (!isPluginLoadingApp(manifest)) {
     return { changed: false, wrappedBins: [] }
   }
-  let changed = false
+  const restored = restoreOfficialPluginIdentities(packageDir)
+  let changed = restored.length > 0
+  let manifestChanged = false
   for (const section of INSTALL_SECTIONS) {
     const current = stringRecord(manifest[section])
     if (Object.keys(current).length === 0 && manifest[section] === undefined) continue
     const merged = mergeDeepseekAiAliases(Object.keys(current).length === 0 ? undefined : current)
     if (!merged.changed) continue
     manifest[section] = merged.deps
+    manifestChanged = true
     changed = true
   }
-  if (changed) writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  // Restore rewrites node_modules only. Do not re-serialize the CLI manifest
+  // unless aliases actually changed (bundled CLI has empty graph deps).
+  if (manifestChanged) writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
 
   const wrappedBins: string[] = []
   for (const relPath of binRelPaths(manifest)) {
@@ -302,6 +385,11 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
         `${filename}: ${relPath} must resolve host @prettier-ai/* specifiers from the CLI parent`,
       )
     }
+    if (!body.includes('function resolveOfficialHost')) {
+      failures.push(
+        `${filename}: ${relPath} must resolve official @deepseek-ai/* specifiers from CLI aliases before remapping`,
+      )
+    }
     const inner = innerBinRelPath(relPath)
     if (!tarballHasMember(tarball, `package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
@@ -311,6 +399,7 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
       failures.push(`${filename}: missing ${loader}`)
     }
   }
+  failures.push(...checkRestoredPluginIdentities(tarball, filename))
   return failures
 }
 
@@ -454,24 +543,46 @@ function isHostSpecifier(specifier) {
   return typeof specifier === 'string' && (specifier === TO.slice(0, -1) || specifier.startsWith(TO))
 }
 
+function isOfficialHostSpecifier(specifier) {
+  return typeof specifier === 'string' && (specifier === FROM.slice(0, -1) || specifier.startsWith(FROM))
+}
+
 function shouldResolveFromProfile(specifier, parentURL) {
   if (!isBarePackageSpecifier(specifier)) return false
-  if (isHostSpecifier(specifier)) return false
+  if (isHostSpecifier(specifier) || isOfficialHostSpecifier(specifier)) return false
   if (parentIsUnderProfiles(parentURL)) return false
   return true
 }
 
-function resolveMapped(specifier, context, nextResolve, cliParentURL) {
+function resolveOfficialHost(specifier, context, nextResolve, cliParentURL) {
   const mapped = mapSpecifier(specifier)
-  if (mapped !== undefined || isHostSpecifier(specifier)) {
+  const fromCli = (id) => nextResolve(id, { ...context, parentURL: cliParentURL })
+  // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
+  // Returning a Promise makes url undefined (ERR_INVALID_RETURN_PROPERTY_VALUE).
+  if (mapped !== undefined) {
     try {
-      // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
-      // Returning a Promise makes url undefined (ERR_INVALID_RETURN_PROPERTY_VALUE).
-      return nextResolve(mapped ?? specifier, { ...context, parentURL: cliParentURL })
+      return fromCli(specifier)
+    } catch {
+      try {
+        return fromCli(mapped)
+      } catch {
+        return nextResolve(specifier, context)
+      }
+    }
+  }
+  if (isHostSpecifier(specifier)) {
+    try {
+      return fromCli(specifier)
     } catch {
       return nextResolve(specifier, context)
     }
   }
+  return undefined
+}
+
+function resolveMapped(specifier, context, nextResolve, cliParentURL) {
+  const host = resolveOfficialHost(specifier, context, nextResolve, cliParentURL)
+  if (host !== undefined) return host
   // Official: profile node_modules first, then the rest. Do not remap
   // dshmarket, @dsh-ssh/*, @aaravarr/*, or dsh-subagent-sidebar.
   if (shouldResolveFromProfile(specifier, context.parentURL)) {
@@ -592,24 +703,47 @@ function isHostSpecifier(specifier) {
   return typeof specifier === 'string' && (specifier === TO.slice(0, -1) || specifier.startsWith(TO))
 }
 
+function isOfficialHostSpecifier(specifier) {
+  return typeof specifier === 'string' && (specifier === FROM.slice(0, -1) || specifier.startsWith(FROM))
+}
+
 function shouldResolveFromProfile(specifier, parentURL) {
   if (!isBarePackageSpecifier(specifier)) return false
-  if (isHostSpecifier(specifier)) return false
+  if (isHostSpecifier(specifier) || isOfficialHostSpecifier(specifier)) return false
   if (parentIsUnderProfiles(parentURL)) return false
   return true
 }
 
-export async function resolve(specifier, context, nextResolve) {
+async function resolveOfficialHost(specifier, context, nextResolve) {
   const mapped = typeof specifier === 'string' && specifier.startsWith(FROM)
     ? TO + specifier.slice(FROM.length)
     : undefined
-  if (mapped !== undefined || isHostSpecifier(specifier)) {
+  const parent = cliParentURL || context.parentURL
+  const fromCli = (id) => nextResolve(id, { ...context, parentURL: parent })
+  if (mapped !== undefined) {
     try {
-      return await nextResolve(mapped ?? specifier, { ...context, parentURL: cliParentURL || context.parentURL })
+      return await fromCli(specifier)
+    } catch {
+      try {
+        return await fromCli(mapped)
+      } catch {
+        return nextResolve(specifier, context)
+      }
+    }
+  }
+  if (isHostSpecifier(specifier)) {
+    try {
+      return await fromCli(specifier)
     } catch {
       return nextResolve(specifier, context)
     }
   }
+  return undefined
+}
+
+export async function resolve(specifier, context, nextResolve) {
+  const host = await resolveOfficialHost(specifier, context, nextResolve)
+  if (host !== undefined) return host
   if (shouldResolveFromProfile(specifier, context.parentURL)) {
     for (const parentURL of profileParentURLs()) {
       try {
@@ -629,6 +763,150 @@ function binRelPaths(manifest: PackedManifest): string[] {
   if (typeof bin === 'string' && bin !== '') return [bin]
   if (bin === null || typeof bin !== 'object' || Array.isArray(bin)) return []
   return Object.values(bin).filter((value): value is string => typeof value === 'string' && value !== '')
+}
+
+function isOfficialAliasDir(packageRoot: string): boolean {
+  return basename(dirname(packageRoot)) === '@deepseek-ai'
+}
+
+function isWireIdentityPackage(name: string, packageRoot: string): boolean {
+  const base = basename(packageRoot)
+  return name.endsWith(`/${CLIENT_MODULES_NAME}`)
+    || name.endsWith(`/${CLIENT_RUNTIME_NAME}`)
+    || base === CLIENT_MODULES_NAME
+    || base === CLIENT_RUNTIME_NAME
+}
+
+function packedMemberText(tarball: string, member: string): string | undefined {
+  const result = spawnSync('tar', ['-xOzf', tarball, member], {
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+  })
+  if (result.status !== 0) return undefined
+  return result.stdout ?? ''
+}
+
+function packedManifestName(body: string): string {
+  const parsed: unknown = JSON.parse(body)
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return ''
+  if (!('name' in parsed)) return ''
+  const name = parsed.name
+  return typeof name === 'string' ? name : ''
+}
+
+function checkRestoredPluginIdentities(tarball: string, filename: string): string[] {
+  const failures: string[] = []
+  const modulesIndex = 'package/node_modules/@prettier-ai/dsh-client-modules/lib/index.js'
+  if (tarballHasMember(tarball, modulesIndex)) {
+    const body = packedMemberText(tarball, modulesIndex)
+    if (body === undefined) {
+      failures.push(`${filename}: failed to read ${modulesIndex}`)
+    } else {
+      for (const published of WIRE_IDENTITY_FROM) {
+        if (body.includes(published)) {
+          failures.push(`${filename}: ${modulesIndex} still contains ${published}`)
+        }
+      }
+      if (!body.includes(`${FROM_SCOPE}${CLIENT_MODULES_NAME}`)) {
+        failures.push(`${filename}: ${modulesIndex} is missing ${FROM_SCOPE}${CLIENT_MODULES_NAME}`)
+      }
+    }
+  }
+  const modulesClient = 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'
+  if (tarballHasMember(tarball, modulesClient)) {
+    const body = packedMemberText(tarball, modulesClient)
+    if (body === undefined) {
+      failures.push(`${filename}: failed to read ${modulesClient}`)
+    } else if (body.includes(TO_SCOPE)) {
+      failures.push(`${filename}: ${modulesClient} still contains ${TO_SCOPE} plugin identities`)
+    }
+  }
+  const aliasManifestPath = 'package/node_modules/@deepseek-ai/dsh-client-modules/package.json'
+  if (tarballHasMember(tarball, aliasManifestPath)) {
+    const body = packedMemberText(tarball, aliasManifestPath)
+    if (body === undefined) {
+      failures.push(`${filename}: failed to read ${aliasManifestPath}`)
+    } else {
+      const name = packedManifestName(body)
+      const expected = `${FROM_SCOPE}${CLIENT_MODULES_NAME}`
+      if (name !== expected) {
+        failures.push(
+          `${filename}: ${aliasManifestPath} name is ${JSON.stringify(name)}, expected ${JSON.stringify(expected)}`,
+        )
+      }
+    }
+  }
+  return failures
+}
+
+function restoreDshClientIdentities(manifest: PackedManifest): boolean {
+  const dsh = manifest.dsh
+  if (dsh === null || typeof dsh !== 'object' || Array.isArray(dsh)) return false
+  const client = (dsh as Record<string, unknown>).client
+  if (client === null || typeof client !== 'object' || Array.isArray(client)) return false
+  const record = client as Record<string, unknown>
+  let changed = false
+  for (const field of ['inject', 'external'] as const) {
+    const value = record[field]
+    if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) continue
+    const next = value.map(item => officialPluginIdentity(item))
+    if (next.some((item, index) => item !== value[index])) {
+      record[field] = next
+      changed = true
+    }
+  }
+  return changed
+}
+
+function restorePublishedScopeInFile(path: string): boolean {
+  if (!existsSync(path)) return false
+  const before = readFileSync(path, 'utf8')
+  if (!before.includes(TO_SCOPE)) return false
+  writeFileSync(path, before.replaceAll(TO_SCOPE, FROM_SCOPE))
+  return true
+}
+
+function restoreWireIdsInFile(path: string): boolean {
+  if (!existsSync(path)) return false
+  let body = readFileSync(path, 'utf8')
+  let changed = false
+  for (const published of WIRE_IDENTITY_FROM) {
+    const official = officialPluginIdentity(published)
+    if (!body.includes(published)) continue
+    body = body.replaceAll(published, official)
+    changed = true
+  }
+  if (changed) writeFileSync(path, body)
+  return changed
+}
+
+function collectScopedPackageDirs(nodeModulesDir: string): string[] {
+  const dirs: string[] = []
+  const seen = new Set<string>()
+  const visitNodeModules = (nm: string): void => {
+    for (const scope of ['@prettier-ai', '@deepseek-ai']) {
+      const scopeDir = join(nm, scope)
+      if (!existsSync(scopeDir)) continue
+      let entries
+      try {
+        entries = readdirSync(scopeDir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue
+        const full = join(scopeDir, entry.name)
+        if (seen.has(full)) continue
+        seen.add(full)
+        if (!existsSync(join(full, 'package.json'))) continue
+        dirs.push(full)
+        const nested = join(full, 'node_modules')
+        if (existsSync(nested)) visitNodeModules(nested)
+      }
+    }
+  }
+  visitNodeModules(nodeModulesDir)
+  return dirs
 }
 
 function stringRecord(value: unknown): Record<string, string> {

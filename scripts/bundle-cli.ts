@@ -41,7 +41,9 @@
  * (runtime loader) before packing. Install-time npm aliases are not written:
  * they would put `@prettier-ai/*` back on `dependencies`. Physical
  * `@deepseek-ai/*` directories inside bundled `node_modules` cover profile
- * `resolve.paths` instead.
+ * `resolve.paths` instead. Alias copies stamp `package.json` `name` back to
+ * `@deepseek-ai/<name>` so Loader ids match; published-scope copies keep
+ * `@prettier-ai/<name>`.
  *
  * Usage:
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm-cli
@@ -403,6 +405,9 @@ export function assertBundledCliManifest(manifest: Readonly<Record<string, unkno
  * as a real directory so profile `resolve.paths` still finds official-scope
  * packages without npm aliases on the published manifest. Leftover relative
  * symlinks are replaced: npm publish rejects symlink members with E415.
+ * Alias `package.json` `name` is `@deepseek-ai/<name>` so 0.1.2
+ * `nearestPackage` accepts the Loader id; the `@prettier-ai` copy keeps the
+ * published name.
  * @param nodeModulesDir - bundled `node_modules`.
  */
 export function materializeDeepseekAiAliases(nodeModulesDir: string): readonly string[] {
@@ -415,11 +420,31 @@ export function materializeDeepseekAiAliases(nodeModulesDir: string): readonly s
     if (name === '.' || name === '..') continue
     const dest = join(deepseekScope, name)
     if (isSymbolicLink(dest)) unlinkSync(dest)
-    else if (existsSync(dest)) continue
+    else if (existsSync(dest)) {
+      stampOfficialAliasName(dest, name)
+      continue
+    }
     cpSync(join(prettierScope, name), dest, { recursive: true, dereference: true })
+    stampOfficialAliasName(dest, name)
     created.push(`@deepseek-ai/${name}`)
   }
   return created
+}
+
+/**
+ * Loader `entry.options.name` is still `@deepseek-ai/<name>`. Official 0.1.2
+ * `nearestPackage` requires package.json `name` to match that id.
+ * @param packageDir - `node_modules/@deepseek-ai/<name>`.
+ * @param unscopedName - the directory name, for example `cordis`.
+ */
+function stampOfficialAliasName(packageDir: string, unscopedName: string): void {
+  const manifestPath = join(packageDir, 'package.json')
+  if (!existsSync(manifestPath)) return
+  const manifest = readJsonObject(manifestPath)
+  const official = `@deepseek-ai/${unscopedName}`
+  if (manifest.name === official) return
+  manifest.name = official
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
 }
 
 /**
