@@ -27,6 +27,15 @@
  * directories until the graph closes. It does not put those names back on the
  * published CLI `dependencies`.
  *
+ * Official `npm i -g @deepseek-ai/dsh` is a thin package: npm fetches `sharp` /
+ * `koffi` platform optional packages for the installing OS. This fat tarball is
+ * built on ubuntu-24.04, so a default install would keep only Linux natives and
+ * Windows `dshp web` would fail to load `sharp` and Koffi. Before install/deploy,
+ * write pnpm `supportedArchitectures` (linux/win32/darwin, x64/arm64, glibc/musl)
+ * so those optional payloads are fetched. After deploy, copy them into the
+ * deploy tree as real directories (no symlinks, no hardlinks). They live in
+ * bundled `node_modules` and are not listed on the published CLI manifest.
+ *
  * The packed bin stays `dsh` at `lib/bin.js`. This script does not add `dshp`.
  * Host-side `@deepseek-ai/*` compatibility is applied to the deploy directory
  * (runtime loader) before packing. Install-time npm aliases are not written:
@@ -38,6 +47,7 @@
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm-cli
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm --replace
  *   node --experimental-strip-types scripts/bundle-cli.ts --published-version --official <ver> [--suffix <id>] [--npm-version <ver>]
+ *   node --experimental-strip-types scripts/bundle-cli.ts --apply-supported-architectures --workspace <dir>
  */
 
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -51,6 +61,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -72,6 +83,13 @@ export const PACKED_NESTED_WORKSPACE_PACKAGES = [
   '@prettier-ai/schemastery',
 ] as const
 
+/** pnpm setting so optional natives are fetched for every OS we publish, not just the pack runner. */
+export const PNPM_SUPPORTED_ARCHITECTURES = {
+  os: ['linux', 'win32', 'darwin'],
+  cpu: ['x64', 'arm64'],
+  libc: ['glibc', 'musl'],
+} as const
+
 const GRAPH_SCOPES = ['@prettier-ai/', '@deepseek-ai/'] as const
 const INSTALL_SECTIONS = ['dependencies', 'optionalDependencies', 'peerDependencies'] as const
 const NPM_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
@@ -87,6 +105,8 @@ interface PackedIdentity {
 export interface PackBundledOptions {
   readonly workspace?: string | undefined
   readonly version?: string | undefined
+  /** Extra `node_modules` to copy native optional packages from (unit-test stub). */
+  readonly nativeModules?: string | undefined
 }
 
 /**
@@ -250,6 +270,64 @@ export function fillMissingWorkspacePackages(deployDir: string, workspaceRoot: s
 }
 
 /**
+ * Write pnpm `supportedArchitectures` onto a checkout's `pnpm-workspace.yaml`
+ * so a later `pnpm install` / `pnpm deploy` fetches win32 and darwin optional
+ * natives, not only the runner's linux packages.
+ * @param workspaceRoot - official checkout root (after rescope).
+ */
+export function applyPnpmSupportedArchitectures(workspaceRoot: string): void {
+  const yamlPath = join(workspaceRoot, 'pnpm-workspace.yaml')
+  if (!existsSync(yamlPath)) {
+    throw new Error(`bundle-cli: ${yamlPath} does not exist`)
+  }
+  const stripped = stripTopLevelYamlKey(readFileSync(yamlPath, 'utf8'), 'supportedArchitectures').replace(/\s+$/, '')
+  writeFileSync(yamlPath, `${stripped}\n\n${pnpmSupportedArchitecturesYaml()}\n`)
+}
+
+/**
+ * Whether a package is a native optional payload official npm would install on
+ * some OS (sharp platform packages, koffi prebuilds, landlock addons).
+ * `@prettier-ai/*` / `@deepseek-ai/*` workspace names stay off the published
+ * CLI manifest; landlock platform addons may still live in bundled `node_modules`.
+ * @param name - package name.
+ */
+export function isNativeOptionalPackageName(name: string): boolean {
+  if (name.startsWith('@img/')) return true
+  if (name.startsWith('@koromix/')) return true
+  if (name === 'koffi' || name.startsWith('koffi-')) return true
+  if (name.startsWith('node-addon-require-builtin')) return true
+  if (name.includes('landlock-run-')) return true
+  return false
+}
+
+/**
+ * Copy native optional packages from a source `node_modules` (workspace install
+ * or a test stub) into the deploy tree as real directories: no leftover
+ * symlinks or hardlinks. Does not write those names onto the CLI manifest.
+ * @param deployDir - `pnpm deploy` output directory.
+ * @param sourceNodeModules - workspace or stub `node_modules`.
+ */
+export function copyNativeOptionalPackages(deployDir: string, sourceNodeModules: string): readonly string[] {
+  if (!existsSync(sourceNodeModules)) return []
+  const destRoot = join(deployDir, 'node_modules')
+  mkdirSync(destRoot, { recursive: true })
+  const copied: string[] = []
+  for (const [name, src] of collectNativeOptionalPackageDirs(sourceNodeModules)) {
+    const dest = join(destRoot, ...name.split('/'))
+    if (resolve(src) === resolve(dest)) {
+      rematerializeDirectory(dest)
+    } else {
+      if (existsSync(dest)) rmSync(dest, { recursive: true, force: true })
+      mkdirSync(dirname(dest), { recursive: true })
+      cpSync(src, dest, { recursive: true, dereference: true })
+    }
+    assertNoLinks(dest)
+    copied.push(name)
+  }
+  return copied
+}
+
+/**
  * Rewrite a CLI manifest so npm will not resolve the workspace graph.
  * Keeps `bin.dsh`; never adds `dshp`. Clears install-time dependency sections
  * (production files already live in bundled `node_modules`).
@@ -366,6 +444,11 @@ export function packBundledDirectory(
   if (workspaceRoot !== undefined && workspaceRoot !== '') {
     fillMissingWorkspacePackages(packageDir, workspaceRoot)
   }
+  const nativeModules = options.nativeModules
+    ?? (workspaceRoot !== undefined && workspaceRoot !== '' ? join(workspaceRoot, 'node_modules') : undefined)
+  if (nativeModules !== undefined && nativeModules !== '') {
+    copyNativeOptionalPackages(packageDir, nativeModules)
+  }
   const publishedVersion = options.version
   if (publishedVersion !== undefined && publishedVersion !== '') {
     stampPackageVersion(packageDir, publishedVersion)
@@ -405,6 +488,7 @@ export function packBundledDirectory(
     throw new Error('bundle-cli: packed tarball contains symbolic links; npm publish rejects those with E415')
   }
   assertPackedContainsNestedWorkspacePackages(file, packageDir, workspaceRoot)
+  assertPackedContainsNativeOptionalPackages(file, packageDir)
   return { name: packed.name, version: packed.version, file }
 }
 
@@ -447,6 +531,7 @@ export function deployAndBundleCli(
     throw new Error(`bundle-cli: apps/cli is ${JSON.stringify(name)}, expected ${JSON.stringify(CLI_PACKAGE_NAME)} (run the rescope first)`)
   }
   if (replace) removePackedCliTarballs(outDir)
+  applyPnpmSupportedArchitectures(workspace)
   const tmp = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-deploy-'))
   const packageDir = join(tmp, 'package')
   try {
@@ -454,6 +539,10 @@ export function deployAndBundleCli(
     const filled = fillMissingWorkspacePackages(packageDir, workspace)
     if (filled.length > 0) {
       console.log(`bundle-cli: filled ${String(filled.length)} missing workspace package(s): ${filled.join(', ')}`)
+    }
+    const natives = copyNativeOptionalPackages(packageDir, join(workspace, 'node_modules'))
+    if (natives.length > 0) {
+      console.log(`bundle-cli: copied ${String(natives.length)} native optional package(s)`)
     }
     return packBundledDirectory(packageDir, outDir, { workspace, version: publishedVersion })
   } finally {
@@ -622,6 +711,68 @@ function addPackageManifest(packageDir: string, paths: string[], seen: Set<strin
   if (existsSync(nested)) walkNodeModulesForManifests(nested, paths, seen)
 }
 
+function stripTopLevelYamlKey(text: string, key: string): string {
+  const start = new RegExp(`^${key}:\\s*(?:#.*)?$`)
+  const lines = text.split(/\r?\n/)
+  const out: string[] = []
+  let skipping = false
+  for (const line of lines) {
+    if (skipping) {
+      if (/^[A-Za-z][\w-]*\s*:/.test(line)) skipping = false
+      else continue
+    }
+    if (start.test(line)) {
+      skipping = true
+      continue
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+function pnpmSupportedArchitecturesYaml(): string {
+  const { os, cpu, libc } = PNPM_SUPPORTED_ARCHITECTURES
+  return [
+    'supportedArchitectures:',
+    '  os:',
+    ...os.map(value => `    - ${value}`),
+    '  cpu:',
+    ...cpu.map(value => `    - ${value}`),
+    '  libc:',
+    ...libc.map(value => `    - ${value}`),
+  ].join('\n')
+}
+
+function collectNativeOptionalPackageDirs(nodeModulesDir: string): Map<string, string> {
+  const found = new Map<string, string>()
+  if (!existsSync(nodeModulesDir)) return found
+  const manifests: string[] = []
+  walkNodeModulesForManifests(nodeModulesDir, manifests, new Set())
+  const pnpmStore = join(nodeModulesDir, '.pnpm')
+  if (existsSync(pnpmStore)) {
+    for (const entry of readdirSync(pnpmStore)) {
+      if (entry.startsWith('.')) continue
+      const nested = join(pnpmStore, entry, 'node_modules')
+      if (existsSync(nested)) walkNodeModulesForManifests(nested, manifests, new Set())
+    }
+  }
+  for (const manifestPath of manifests) {
+    const name = readJsonObject(manifestPath).name
+    if (typeof name !== 'string' || name === '' || !isNativeOptionalPackageName(name)) continue
+    if (!found.has(name)) found.set(name, dirname(manifestPath))
+  }
+  return found
+}
+
+function rematerializeDirectory(dir: string): void {
+  const parent = dirname(dir)
+  const tmp = join(parent, `${basename(dir)}.bundle-cli-real`)
+  rmSync(tmp, { recursive: true, force: true })
+  cpSync(dir, tmp, { recursive: true, dereference: true })
+  rmSync(dir, { recursive: true, force: true })
+  renameSync(tmp, dir)
+}
+
 function copyWorkspacePackage(src: string, dest: string): void {
   mkdirSync(dirname(dest), { recursive: true })
   cpSync(src, dest, {
@@ -646,6 +797,15 @@ function assertNoLinks(dir: string): void {
       throw new Error(`bundle-cli: copied package still contains hardlink ${full}`)
     }
     if (entry.isDirectory()) assertNoLinks(full)
+  }
+}
+
+function assertPackedContainsNativeOptionalPackages(file: string, packageDir: string): void {
+  for (const name of collectNativeOptionalPackageDirs(join(packageDir, 'node_modules')).keys()) {
+    const prefix = `package/node_modules/${name}/`
+    if (!tarballHasPathPrefix(file, prefix)) {
+      throw new Error(`bundle-cli: packed tarball is missing ${prefix}`)
+    }
   }
 }
 
@@ -793,9 +953,19 @@ function main(): void {
       suffix: { type: 'string' },
       'npm-version': { type: 'string' },
       'published-version': { type: 'boolean', default: false },
+      'apply-supported-architectures': { type: 'boolean', default: false },
     },
     allowPositionals: false,
   })
+  if (values['apply-supported-architectures'] === true) {
+    const workspace = values.workspace
+    if (workspace === undefined || workspace === '') {
+      throw new Error('bundle-cli: --apply-supported-architectures requires --workspace')
+    }
+    applyPnpmSupportedArchitectures(resolve(workspace))
+    console.log(`bundle-cli: wrote pnpm supportedArchitectures under ${resolve(workspace)}`)
+    return
+  }
   if (values['published-version'] === true) {
     const official = values.official
     if (official === undefined || official === '') {

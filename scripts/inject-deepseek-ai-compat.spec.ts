@@ -22,6 +22,17 @@ function makeTemp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix))
 }
 
+
+function writeBarePlugin(dir: string, name: string, id: string): void {
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'package.json'), `${JSON.stringify({
+    name,
+    type: 'module',
+    exports: { '.': './index.js' },
+  }, null, 2)}\n`)
+  writeFileSync(join(dir, 'index.js'), `export const id = ${JSON.stringify(id)}\n`)
+}
+
 function writeCliFixture(packageDir: string, options?: {
   name?: string
   dependencies?: Record<string, string>
@@ -59,6 +70,13 @@ describe('mapDeepseekAiSpecifier', () => {
     expect(mapDeepseekAiSpecifier('./@deepseek-ai/cordis')).toBeUndefined()
     expect(mapDeepseekAiSpecifier('file:///tmp/@deepseek-ai/cordis')).toBeUndefined()
     expect(mapDeepseekAiSpecifier('commander')).toBeUndefined()
+  })
+
+  it('does not remap profile plugins that official dsh loads by name', () => {
+    expect(mapDeepseekAiSpecifier('dshmarket')).toBeUndefined()
+    expect(mapDeepseekAiSpecifier('@dsh-ssh/dsh-ssh')).toBeUndefined()
+    expect(mapDeepseekAiSpecifier('@aaravarr/dsh-subagent-max')).toBeUndefined()
+    expect(mapDeepseekAiSpecifier('dsh-subagent-sidebar')).toBeUndefined()
   })
 })
 
@@ -260,5 +278,72 @@ describe('runtime hook', () => {
       cwd: join(root, 'profile-plugin'),
     })
     expect(result.trim()).toBe('from-prettier-ai')
+  })
+
+  it('loads profile plugins from DSH_HOME when the CLI is nested under dshp', () => {
+    const root = makeTemp('dsh-compat-nested-')
+    const dshDir = join(root, 'prefix/node_modules/@prettier-ai/dshp/node_modules/@prettier-ai/dsh')
+    writeCliFixture(dshDir, {
+      binSource: [
+        '#!/usr/bin/env node',
+        'for (const name of process.argv.slice(2)) {',
+        '  const mod = await import(name)',
+        '  console.log(mod.id)',
+        '}',
+        '',
+      ].join('\n'),
+    })
+    mkdirSync(join(dshDir, 'node_modules/@prettier-ai/cordis'), { recursive: true })
+    writeFileSync(join(dshDir, 'node_modules/@prettier-ai/cordis/package.json'), `${JSON.stringify({
+      name: '@prettier-ai/cordis',
+      type: 'module',
+      exports: { '.': './index.js' },
+    }, null, 2)}\n`)
+    writeFileSync(
+      join(dshDir, 'node_modules/@prettier-ai/cordis/index.js'),
+      'export const id = "from-prettier-ai"\n',
+    )
+    writeBarePlugin(join(dshDir, 'node_modules/dshmarket'), 'dshmarket', 'from-cli-tarball')
+
+    const dshHome = join(root, 'dsh-home')
+    const profileNm = join(dshHome, 'profiles/web/node_modules')
+    mkdirSync(join(dshHome, 'profiles/web'), { recursive: true })
+    writeFileSync(join(dshHome, 'profiles/web/package.json'), `${JSON.stringify({
+      name: 'web',
+      type: 'module',
+    }, null, 2)}\n`)
+    writeBarePlugin(join(profileNm, 'dshmarket'), 'dshmarket', 'from-profile-dshmarket')
+    writeBarePlugin(join(profileNm, '@dsh-ssh/dsh-ssh'), '@dsh-ssh/dsh-ssh', 'from-profile-dsh-ssh')
+    writeBarePlugin(join(profileNm, '@aaravarr/dsh-subagent-max'), '@aaravarr/dsh-subagent-max', 'from-profile-subagent-max')
+    writeBarePlugin(join(profileNm, 'dsh-subagent-sidebar'), 'dsh-subagent-sidebar', 'from-profile-sidebar')
+
+    injectPackageDir(dshDir)
+    const wrapper = readFileSync(join(dshDir, 'lib/bin.js'), 'utf8')
+    expect(wrapper).not.toMatch(/async function resolveMapped/)
+    expect(wrapper).toMatch(/function resolveMapped\(/)
+    expect(wrapper).toContain('profileParentURLs')
+    expect(JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8')).bin).toEqual({ dsh: 'lib/bin.js' })
+    expect(JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8')).bin).not.toHaveProperty('dshp')
+
+    mkdirSync(join(root, 'elsewhere'), { recursive: true })
+    const result = execFileSync(process.execPath, [
+      join(dshDir, 'lib/bin.js'),
+      'dshmarket',
+      '@dsh-ssh/dsh-ssh',
+      '@aaravarr/dsh-subagent-max',
+      'dsh-subagent-sidebar',
+      '@deepseek-ai/cordis',
+    ], {
+      encoding: 'utf8',
+      cwd: join(root, 'elsewhere'),
+      env: { ...process.env, DSH_HOME: dshHome },
+    })
+    expect(result.trim().split('\n')).toEqual([
+      'from-profile-dshmarket',
+      'from-profile-dsh-ssh',
+      'from-profile-subagent-max',
+      'from-profile-sidebar',
+      'from-prettier-ai',
+    ])
   })
 })

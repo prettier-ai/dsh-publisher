@@ -17,17 +17,21 @@ import { describe, expect, it } from 'vitest'
 import { OVERLAY_SCRIPT_FILES, shouldRewritePath } from './rescope-to-prettier-ai.ts'
 import { checkAppliedCompat, DEEPSEEK_AI_COMPAT_MARKER } from './inject-deepseek-ai-compat.ts'
 import {
+  applyPnpmSupportedArchitectures,
   assertBundledCliManifest,
   bundleCliManifest,
   bundledFilesField,
   CLI_BIN_NAME,
   CLI_BIN_PATH,
   CLI_PACKAGE_NAME,
+  copyNativeOptionalPackages,
   fillMissingWorkspacePackages,
+  isNativeOptionalPackageName,
   isPublishedGraphDependency,
   materializeDeepseekAiAliases,
   packBundledDirectory,
   parsePnpmWorkspacePackageGlobs,
+  PNPM_SUPPORTED_ARCHITECTURES,
   prettierAiDshStarDependencyNames,
   publishedNpmVersion,
   removePackedCliTarballs,
@@ -133,6 +137,19 @@ function writeMiniWorkspace(root: string): void {
     name: '@prettier-ai/schemastery',
     version: '3.16.1',
   }, null, 2)}\n`)
+}
+
+
+function writeNativeStub(nodeModules: string, name: string, file = 'index.js'): void {
+  const dir = join(nodeModules, ...name.split('/'))
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'package.json'), `${JSON.stringify({
+    name,
+    version: '1.0.0',
+    os: ['win32'],
+    cpu: ['x64'],
+  }, null, 2)}\n`)
+  writeFileSync(join(dir, file), 'export const ok = true\n')
 }
 
 function packThinCli(parent: string, name: string, version: string, tarballName: string): string {
@@ -277,6 +294,78 @@ describe('bundleCliManifest', () => {
     ])
     expect(bundledFilesField(['lib/*.js'])).toEqual(['lib/*.js', 'node_modules'])
     expect(bundledFilesField(['lib/*.js', 'node_modules'])).toEqual(['lib/*.js', 'node_modules'])
+  })
+})
+
+describe('isNativeOptionalPackageName', () => {
+  it('matches sharp, koffi, require-builtin, and landlock platform packages', () => {
+    expect(isNativeOptionalPackageName('@img/sharp-win32-x64')).toBe(true)
+    expect(isNativeOptionalPackageName('@img/sharp-libvips-linux-arm64')).toBe(true)
+    expect(isNativeOptionalPackageName('@koromix/koffi-win32-x64')).toBe(true)
+    expect(isNativeOptionalPackageName('koffi')).toBe(true)
+    expect(isNativeOptionalPackageName('node-addon-require-builtin-win32-x64-msvc')).toBe(true)
+    expect(isNativeOptionalPackageName('@prettier-ai/node-addon-landlock-run-linux-x64')).toBe(true)
+    expect(isNativeOptionalPackageName('@prettier-ai/dsh-attachment-local')).toBe(false)
+    expect(isNativeOptionalPackageName('commander')).toBe(false)
+  })
+})
+
+describe('applyPnpmSupportedArchitectures', () => {
+  it('appends linux/win32/darwin x64/arm64 glibc/musl and is idempotent', () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-bundle-arch-'))
+    writeMiniWorkspace(workspace)
+    applyPnpmSupportedArchitectures(workspace)
+    const yaml = readFileSync(join(workspace, 'pnpm-workspace.yaml'), 'utf8')
+    expect(yaml).toContain('supportedArchitectures:')
+    expect(yaml).toContain('- win32')
+    expect(yaml).toContain('- darwin')
+    expect(yaml).toContain('- linux')
+    expect(yaml).toContain('- arm64')
+    expect(yaml).toContain('- musl')
+    expect(PNPM_SUPPORTED_ARCHITECTURES.os).toEqual(['linux', 'win32', 'darwin'])
+    expect(parsePnpmWorkspacePackageGlobs(yaml)).toEqual(['vendor/*', 'packages/*/*', 'apps/*'])
+    applyPnpmSupportedArchitectures(workspace)
+    const again = readFileSync(join(workspace, 'pnpm-workspace.yaml'), 'utf8')
+    expect(again.split('supportedArchitectures:').length).toBe(2)
+  })
+})
+
+describe('copyNativeOptionalPackages', () => {
+  it('copies win32 sharp/koffi stubs as real directories without listing them on the CLI manifest', () => {
+    const source = join(mkdtempSync(join(tmpdir(), 'dsh-bundle-native-src-')), 'node_modules')
+    writeNativeStub(source, '@img/sharp-linux-x64')
+    writeNativeStub(source, '@img/sharp-win32-x64')
+    writeNativeStub(source, '@koromix/koffi-win32-x64')
+    mkdirSync(join(source, '@img/sharp-win32-x64-link'), { recursive: true })
+    writeFileSync(join(source, '@img/sharp-win32-x64-link/package.json'), '{"name":"@img/sharp-win32-x64-link"}\n')
+    const deploy = mkdtempSync(join(tmpdir(), 'dsh-bundle-native-deploy-'))
+    mkdirSync(join(deploy, 'node_modules/@img'), { recursive: true })
+    symlinkSync(join(source, '@img/sharp-linux-x64'), join(deploy, 'node_modules/@img/sharp-linux-x64'))
+    const copied = [...copyNativeOptionalPackages(deploy, source)].sort()
+    expect(copied).toEqual([
+      '@img/sharp-linux-x64',
+      '@img/sharp-win32-x64',
+      '@img/sharp-win32-x64-link',
+      '@koromix/koffi-win32-x64',
+    ].sort())
+    expect(lstatSync(join(deploy, 'node_modules/@img/sharp-win32-x64')).isSymbolicLink()).toBe(false)
+    expect(lstatSync(join(deploy, 'node_modules/@img/sharp-linux-x64')).isSymbolicLink()).toBe(false)
+    expect(existsSync(join(deploy, 'node_modules/@koromix/koffi-win32-x64/package.json'))).toBe(true)
+  })
+
+  it('copies native stubs that only exist under .pnpm store node_modules', () => {
+    const source = join(mkdtempSync(join(tmpdir(), 'dsh-bundle-native-pnpm-')), 'node_modules')
+    const stored = join(source, '.pnpm/@img+sharp-darwin-arm64@0.33.5/node_modules/@img/sharp-darwin-arm64')
+    writeNativeStub(join(source, '.pnpm/@img+sharp-darwin-arm64@0.33.5/node_modules'), '@img/sharp-darwin-arm64')
+    mkdirSync(join(source, 'commander'), { recursive: true })
+    writeFileSync(join(source, 'commander/package.json'), '{"name":"commander"}\n')
+    const deploy = mkdtempSync(join(tmpdir(), 'dsh-bundle-native-pnpm-deploy-'))
+    const copied = [...copyNativeOptionalPackages(deploy, source)].sort()
+    expect(copied).toEqual(['@img/sharp-darwin-arm64'])
+    expect(existsSync(join(deploy, 'node_modules/@img/sharp-darwin-arm64/package.json'))).toBe(true)
+    expect(existsSync(join(deploy, 'node_modules/commander'))).toBe(false)
+    expect(lstatSync(join(deploy, 'node_modules/@img/sharp-darwin-arm64')).isSymbolicLink()).toBe(false)
+    expect(existsSync(stored)).toBe(true)
   })
 })
 
@@ -444,6 +533,31 @@ describe('packBundledDirectory', () => {
     expect(() => checkAppliedCompat(out)).not.toThrow()
   })
 
+  it('packs stubbed non-linux sharp/koffi natives and keeps empty graph dependency sections', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-natives-'))
+    writeDeployFixture(packageDir)
+    const nativeModules = join(mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-native-nm-')), 'node_modules')
+    writeNativeStub(nativeModules, '@img/sharp-win32-x64')
+    writeNativeStub(nativeModules, '@koromix/koffi-darwin-arm64')
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-natives-out-'))
+    const packed = packBundledDirectory(packageDir, out, { nativeModules })
+    const manifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/package.json'], { encoding: 'utf8' }),
+    ) as {
+      dependencies?: Record<string, string>
+      optionalDependencies?: Record<string, string>
+      peerDependencies?: Record<string, string>
+    }
+    expect(manifest.dependencies).toBeUndefined()
+    expect(manifest.optionalDependencies).toBeUndefined()
+    expect(manifest.peerDependencies).toBeUndefined()
+    expect(scopedWorkspaceDependencyNames(manifest.dependencies)).toEqual([])
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@img/sharp-win32-x64/package.json')).toBe(true)
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@koromix/koffi-darwin-arm64/package.json')).toBe(true)
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
+  })
+
   it('fills nested workspace packages into the packed tarball and stamps a published version', () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-bundle-ws-pack-'))
     writeMiniWorkspace(workspace)
@@ -586,6 +700,16 @@ describe('workflows', () => {
     expect(cli).toContain('bundle-cli.ts --workspace . --out dist/npm-cli')
     expect(cli).toContain('inject-deepseek-ai-compat.ts --check --applied --from dist/npm-cli')
     expect(cli).not.toContain('pnpm --dir apps/cli pack')
+    expect(cli).toContain('--apply-supported-architectures')
+    expect(sync).toContain('--apply-supported-architectures')
+    expect(cli).toContain('--workspace upstream')
+    expect(sync).toContain('--workspace upstream')
+    const cliInstall = cli.indexOf('pnpm install --ignore-scripts')
+    const syncInstall = sync.indexOf('pnpm install --ignore-scripts')
+    expect(cli.indexOf('--apply-supported-architectures')).toBeGreaterThan(-1)
+    expect(cli.indexOf('--apply-supported-architectures')).toBeLessThan(cliInstall)
+    expect(sync.indexOf('--apply-supported-architectures')).toBeLessThan(syncInstall)
+    expect(cli).toContain('Fetch optional natives for every published OS')
     expect(cli).not.toMatch(/^\s+- cron:/m)
     expect(cli).not.toMatch(/^\s+pnpm run release:pack --family/m)
   })

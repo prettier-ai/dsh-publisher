@@ -13,7 +13,9 @@
 # packages as `dependencies` (npm must not resolve that peer graph). After
 # deploy it copies nested workspace packages that `pnpm deploy --prod --legacy`
 # omitted (for example `@prettier-ai/cosmokit` via cordis) into that tree as
-# real directories. The runtime `@deepseek-ai/*` loader is applied to that
+# real directories, and copies all-platform optional natives (`sharp` / `koffi`
+# / landlock addons) so Windows and macOS load them like official `dsh`. The
+# runtime `@deepseek-ai/*` loader is applied to that
 # bundled tree. It then packs `@prettier-ai/dshp` from this repository, uploads
 # both, and `npm publish`es them when NPM_TOKEN is set. It never calls
 # `release:pack --family` or `release:publish --family`.
@@ -175,6 +177,13 @@ jobs:
         with:
           package_json_file: upstream/package.json
           dest: ${{ runner.temp }}/setup-pnpm
+
+      - name: Fetch optional natives for every published OS
+        run: |
+          set -euo pipefail
+          # Publisher checkout, not upstream/scripts: official build:official
+          # typechecks scripts/*.ts and this overlay keeps @deepseek-ai/ as data.
+          node --experimental-strip-types scripts/bundle-cli.ts --apply-supported-architectures --workspace upstream
 
       - name: Install the rescoped workspace
         working-directory: upstream

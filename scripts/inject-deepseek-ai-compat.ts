@@ -369,8 +369,9 @@ function wrapperSource(innerSpecifier: string): string {
   return `#!/usr/bin/env node
 /* ${COMPAT_MARKER} */
 import * as nodeModule from 'node:module'
-import { existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, relative } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { MessageChannel } from 'node:worker_threads'
 
@@ -380,6 +381,45 @@ const TO = ${JSON.stringify(TO_SCOPE)}
 function mapSpecifier(specifier) {
   if (typeof specifier !== 'string' || !specifier.startsWith(FROM)) return undefined
   return TO + specifier.slice(FROM.length)
+}
+
+function resolveDshHome() {
+  const fromEnv = process.env.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim()
+  return join(homedir(), '.dsh')
+}
+
+function pathIsInside(root, target) {
+  const rel = relative(root, target)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+function parentIsUnderProfiles(parentURL) {
+  if (typeof parentURL !== 'string' || parentURL === '') return false
+  let path
+  try {
+    path = fileURLToPath(parentURL)
+  } catch {
+    return false
+  }
+  return pathIsInside(join(resolveDshHome(), 'profiles'), path)
+}
+
+function profileParentURLs() {
+  const profilesDir = join(resolveDshHome(), 'profiles')
+  const urls = []
+  let names
+  try {
+    names = readdirSync(profilesDir)
+  } catch {
+    return urls
+  }
+  for (const name of names) {
+    if (name === 'node_modules' || name === '.' || name === '..') continue
+    const pkg = join(profilesDir, name, 'package.json')
+    if (existsSync(pkg)) urls.push(pathToFileURL(pkg).href)
+  }
+  return urls
 }
 
 function findInstallRoot(fromUrl) {
@@ -394,16 +434,43 @@ function findInstallRoot(fromUrl) {
   }
 }
 
+function isBarePackageSpecifier(specifier) {
+  if (typeof specifier !== 'string' || specifier === '') return false
+  if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('file:') || specifier.startsWith('node:')) return false
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return false
+  return true
+}
+
+function shouldResolveFromProfile(specifier, parentURL) {
+  if (!isBarePackageSpecifier(specifier)) return false
+  if (specifier === TO.slice(0, -1) || specifier.startsWith(TO)) return false
+  if (parentIsUnderProfiles(parentURL)) return false
+  return true
+}
+
 function resolveMapped(specifier, context, nextResolve, cliParentURL) {
   const mapped = mapSpecifier(specifier)
-  if (mapped === undefined) return nextResolve(specifier, context)
-  try {
-    // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
-    // Returning a Promise makes url undefined (ERR_INVALID_RETURN_PROPERTY_VALUE).
-    return nextResolve(mapped, { ...context, parentURL: cliParentURL })
-  } catch {
-    return nextResolve(specifier, context)
+  if (mapped !== undefined) {
+    try {
+      // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
+      // Returning a Promise makes url undefined (ERR_INVALID_RETURN_PROPERTY_VALUE).
+      return nextResolve(mapped, { ...context, parentURL: cliParentURL })
+    } catch {
+      return nextResolve(specifier, context)
+    }
   }
+  // Official: profile node_modules first, then the rest. Do not remap
+  // dshmarket, @dsh-ssh/*, @aaravarr/*, or dsh-subagent-sidebar.
+  if (shouldResolveFromProfile(specifier, context.parentURL)) {
+    for (const parentURL of profileParentURLs()) {
+      try {
+        return nextResolve(specifier, { ...context, parentURL })
+      } catch {
+        // try the next profile directory
+      }
+    }
+  }
+  return nextResolve(specifier, context)
 }
 
 async function registerCompat() {
@@ -443,10 +510,54 @@ await import(${JSON.stringify(innerSpecifier)})
 }
 
 function loaderSource(): string {
-  return `const FROM = ${JSON.stringify(FROM_SCOPE)}
+  return `import { existsSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { isAbsolute, join, relative } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+const FROM = ${JSON.stringify(FROM_SCOPE)}
 const TO = ${JSON.stringify(TO_SCOPE)}
 
 let cliParentURL = ''
+
+function resolveDshHome() {
+  const fromEnv = process.env.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim()
+  return join(homedir(), '.dsh')
+}
+
+function pathIsInside(root, target) {
+  const rel = relative(root, target)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+function parentIsUnderProfiles(parentURL) {
+  if (typeof parentURL !== 'string' || parentURL === '') return false
+  let path
+  try {
+    path = fileURLToPath(parentURL)
+  } catch {
+    return false
+  }
+  return pathIsInside(join(resolveDshHome(), 'profiles'), path)
+}
+
+function profileParentURLs() {
+  const profilesDir = join(resolveDshHome(), 'profiles')
+  const urls = []
+  let names
+  try {
+    names = readdirSync(profilesDir)
+  } catch {
+    return urls
+  }
+  for (const name of names) {
+    if (name === 'node_modules' || name === '.' || name === '..') continue
+    const pkg = join(profilesDir, name, 'package.json')
+    if (existsSync(pkg)) urls.push(pathToFileURL(pkg).href)
+  }
+  return urls
+}
 
 export async function initialize(data) {
   if (data !== null && typeof data === 'object' && 'cliParentURL' in data && typeof data.cliParentURL === 'string') {
@@ -457,16 +568,39 @@ export async function initialize(data) {
   }
 }
 
+function isBarePackageSpecifier(specifier) {
+  if (typeof specifier !== 'string' || specifier === '') return false
+  if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('file:') || specifier.startsWith('node:')) return false
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return false
+  return true
+}
+
+function shouldResolveFromProfile(specifier, parentURL) {
+  if (!isBarePackageSpecifier(specifier)) return false
+  if (specifier === TO.slice(0, -1) || specifier.startsWith(TO)) return false
+  if (parentIsUnderProfiles(parentURL)) return false
+  return true
+}
+
 export async function resolve(specifier, context, nextResolve) {
-  if (typeof specifier !== 'string' || !specifier.startsWith(FROM)) {
-    return nextResolve(specifier, context)
+  if (typeof specifier === 'string' && specifier.startsWith(FROM)) {
+    const mapped = TO + specifier.slice(FROM.length)
+    try {
+      return await nextResolve(mapped, { ...context, parentURL: cliParentURL || context.parentURL })
+    } catch {
+      return nextResolve(specifier, context)
+    }
   }
-  const mapped = TO + specifier.slice(FROM.length)
-  try {
-    return await nextResolve(mapped, { ...context, parentURL: cliParentURL || context.parentURL })
-  } catch {
-    return nextResolve(specifier, context)
+  if (shouldResolveFromProfile(specifier, context.parentURL)) {
+    for (const parentURL of profileParentURLs()) {
+      try {
+        return await nextResolve(specifier, { ...context, parentURL })
+      } catch {
+        // try the next profile directory
+      }
+    }
   }
+  return nextResolve(specifier, context)
 }
 `
 }
