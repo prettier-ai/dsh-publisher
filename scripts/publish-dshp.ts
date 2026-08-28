@@ -4,17 +4,18 @@
  * This package lives in this publisher repository (`packages/dshp`). It is
  * not part of the official Harness tree and must not be copied into
  * `upstream/packages/` (that workspace would pick it up). Workflows pack it
- * from this checkout after `@prettier-ai/dsh` is on npm (or already present),
- * then publish with the same integrity skip/conflict rules as
- * `publish-cli-tarball.ts`. The published bin is `dshp` only; `@prettier-ai/dsh`
- * keeps `bin.dsh`.
+ * from this checkout after `@prettier-ai/dsh` is on npm (or already present).
+ * If this version is already on npm, publish skips without failing (Pack CLI
+ * #4 shipped the wrapper after the bundled CLI PUT was rejected). It does not
+ * overwrite a published tarball. The published bin is `dshp` only;
+ * `@prettier-ai/dsh` keeps `bin.dsh`.
  *
  * Usage:
  *   node --experimental-strip-types scripts/publish-dshp.ts --pack --version <ver> --out dist/npm-dshp
  *   node --experimental-strip-types scripts/publish-dshp.ts --from dist/npm-dshp
  */
 
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import {
   chmodSync,
   copyFileSync,
@@ -32,10 +33,10 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import {
-  cliPublishConflictMessage,
-  decideCliTarballPublish,
+  publishNpmTarball,
   readRegistryIntegrity,
-  tarballIntegrity,
+  type RegistryIntegrity,
+  type TarballPublishIo,
 } from './publish-cli-tarball.ts'
 
 export const DSHP_PACKAGE_NAME = '@prettier-ai/dshp'
@@ -58,6 +59,9 @@ interface DshpManifest {
   readonly dependencies: Readonly<Record<string, string>>
 }
 
+/** What to do with a packed dshp tarball given the registry. */
+export type DshpPublishDecision = 'publish' | 'skip'
+
 /**
  * Stamp `@prettier-ai/dshp` to the same version as `@prettier-ai/dsh`.
  * The committed package.json uses `0.0.0` as a placeholder.
@@ -72,6 +76,15 @@ export function dshpManifestFor(version: string, base: Readonly<Record<string, u
     bin: { [DSHP_BIN_NAME]: DSHP_BIN_PATH },
     dependencies: { [DSH_PACKAGE_NAME]: version },
   }
+}
+
+/**
+ * Skip when the wrapper version already exists. Do not overwrite, and do not
+ * fail a CLI retry that needs to publish `@prettier-ai/dsh` after dshp shipped.
+ * @param registry - current registry state for `@prettier-ai/dshp@version`.
+ */
+export function decideDshpTarballPublish(registry: RegistryIntegrity): DshpPublishDecision {
+  return registry.kind === 'present' ? 'skip' : 'publish'
 }
 
 /**
@@ -167,6 +180,28 @@ export function packDshp(version: string, outDir: string, sourceDir = DEFAULT_SO
   return packed
 }
 
+/**
+ * Skip when the wrapper is already on npm; otherwise publish it.
+ * @param directory - directory of packed `.tgz` files.
+ * @param io - optional fetch/publish substitutes for tests.
+ */
+export async function publishPackedDshp(directory: string, io: TarballPublishIo = {}): Promise<void> {
+  const fetchImpl = io.fetchImpl ?? fetch
+  const publish = io.publish ?? ((tarball: string, version: string) => {
+    publishNpmTarball(tarball, version, ['--access', 'public'])
+  })
+  const packed = findDshpTarball(directory)
+  const manifest = readPackedManifest(packed.file)
+  assertDshpPackageShape(manifest, packed.version)
+  const registry = await readRegistryIntegrity(packed.name, packed.version, fetchImpl)
+  if (decideDshpTarballPublish(registry) === 'skip') {
+    console.log(`publish-dshp: ${packed.name}@${packed.version} already on the registry, skipping`)
+    return
+  }
+  publish(packed.file, packed.version)
+  console.log(`publish-dshp: ${packed.name}@${packed.version} published`)
+}
+
 function readPackedManifest(tarball: string): DshpManifest {
   const parsed: unknown = JSON.parse(
     execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], { encoding: 'utf8' }),
@@ -226,35 +261,6 @@ function readJsonObject(path: string): Record<string, unknown> {
   return parsed as Record<string, unknown>
 }
 
-function publishTarball(tarball: string, version: string): void {
-  const tagArgs = version.includes('-') ? ['--tag', 'next'] : []
-  const result = spawnSync('npm', ['publish', tarball, '--access', 'public', ...tagArgs], { encoding: 'utf8' })
-  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
-  if (result.status === 0) {
-    if (output !== '') process.stdout.write(output)
-    return
-  }
-  throw new Error(`npm publish ${tarball} failed:\n${output}`)
-}
-
-async function publishFrom(directory: string): Promise<void> {
-  const packed = findDshpTarball(directory)
-  const manifest = readPackedManifest(packed.file)
-  assertDshpPackageShape(manifest, packed.version)
-  const local = tarballIntegrity(packed.file)
-  const registry = await readRegistryIntegrity(packed.name, packed.version)
-  const decision = decideCliTarballPublish(local, registry)
-  if (decision === 'skip') {
-    console.log(`publish-dshp: ${packed.name}@${packed.version} already published with matching integrity, skipping`)
-    return
-  }
-  if (decision === 'conflict') {
-    throw new Error(cliPublishConflictMessage(packed.name, packed.version))
-  }
-  publishTarball(packed.file, packed.version)
-  console.log(`publish-dshp: ${packed.name}@${packed.version} published`)
-}
-
 async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
@@ -285,7 +291,7 @@ async function main(): Promise<void> {
   if (from === undefined || from === '') {
     throw new Error('publish-dshp: --from <packed directory> or --pack --version --out is required')
   }
-  await publishFrom(from)
+  await publishPackedDshp(from)
 }
 
 if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {

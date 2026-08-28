@@ -9,6 +9,11 @@
  * the lockfile, copies production `node_modules` into the tarball, and strips
  * those workspace names from the published manifest.
  *
+ * `pnpm deploy` hard-links files from the content-addressable store. GNU tar
+ * would store those as hard-link members, and npm then rejects the PUT with
+ * `E415 Hard link is not allowed`. Pack with `--hard-dereference` so each
+ * member is a regular file. Keep `@deepseek-ai/*` symlinks (not hard links).
+ *
  * The packed bin stays `dsh` at `lib/bin.js`. This script does not add `dshp`.
  * Host-side `@deepseek-ai/*` compatibility is applied to the deploy directory
  * (runtime loader) before packing. Install-time npm aliases are not written:
@@ -207,7 +212,8 @@ export function packBundledDirectory(packageDir: string, outDir: string): Packed
     const parent = join(tmp, 'parent')
     mkdirSync(parent)
     execFileSync('cp', ['-a', packageDir, join(parent, 'package')])
-    execFileSync('tar', ['-czf', file, '-C', parent, 'package'])
+    // --hard-dereference: npm rejects tar hard-link members (E415). Keep symlinks.
+    execFileSync('tar', ['--hard-dereference', '-czf', file, '-C', parent, 'package'])
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -218,6 +224,9 @@ export function packBundledDirectory(packageDir: string, outDir: string): Packed
   assertBundledCliManifest(readPackedManifest(file))
   if (!tarballHasPathPrefix(file, 'package/node_modules/')) {
     throw new Error('bundle-cli: packed tarball is missing package/node_modules/')
+  }
+  if (tarballHasHardLinks(file)) {
+    throw new Error('bundle-cli: packed tarball contains hard links; npm publish rejects those with E415')
   }
   return { name: packed.name, version: packed.version, file }
 }
@@ -357,17 +366,10 @@ function readPackedIdentity(tarball: string): { name: string; version: string } 
   return { name, version }
 }
 
-/**
- * Whether a packed tarball lists a member whose path contains `prefix`.
- * Streams `tar -tzf` through grep so a bundled CLI `node_modules` listing
- * cannot hit Node's 1 MiB spawnSync maxBuffer (`ENOBUFS`).
- * @param tarball - path to a `.tgz`.
- * @param prefix - path prefix, for example `package/node_modules/`.
- */
-export function tarballHasPathPrefix(tarball: string, prefix: string): boolean {
+function pipeTarGrep(tarball: string, script: string, argv0: string, extraArgs: readonly string[] = []): boolean {
   const result = spawnSync(
     'sh',
-    ['-c', 'tar -tzf "$1" | grep -F -m1 -- "$2" >/dev/null', 'tarball-has-prefix', tarball, prefix],
+    ['-c', script, argv0, tarball, ...extraArgs],
     { encoding: 'utf8' },
   )
   if (result.status === 0) return true
@@ -377,7 +379,36 @@ export function tarballHasPathPrefix(tarball: string, prefix: string): boolean {
     : result.error instanceof Error
       ? result.error.message
       : `status ${String(result.status)}`
-  throw new Error(`bundle-cli: tar -tzf failed: ${detail}`)
+  throw new Error(`bundle-cli: tar listing failed: ${detail}`)
+}
+
+/**
+ * Whether a packed tarball lists a member whose path contains `prefix`.
+ * Streams `tar -tzf` through grep so a bundled CLI `node_modules` listing
+ * cannot hit Node's 1 MiB spawnSync maxBuffer (`ENOBUFS`).
+ * @param tarball - path to a `.tgz`.
+ * @param prefix - path prefix, for example `package/node_modules/`.
+ */
+export function tarballHasPathPrefix(tarball: string, prefix: string): boolean {
+  return pipeTarGrep(
+    tarball,
+    'tar -tzf "$1" | grep -F -m1 -- "$2" >/dev/null',
+    'tarball-has-prefix',
+    [prefix],
+  )
+}
+
+/**
+ * Whether GNU tar stored any hard-link members (`link to`).
+ * npm publish rejects those with HTTP 415.
+ * @param tarball - path to a `.tgz`.
+ */
+export function tarballHasHardLinks(tarball: string): boolean {
+  return pipeTarGrep(
+    tarball,
+    'tar -tvf "$1" | grep -F -m1 -- " link to " >/dev/null',
+    'tarball-has-hard-links',
+  )
 }
 
 function main(): void {

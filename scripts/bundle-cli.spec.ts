@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -18,6 +18,7 @@ import {
   prettierAiDshStarDependencyNames,
   removePackedCliTarballs,
   scopedWorkspaceDependencyNames,
+  tarballHasHardLinks,
   tarballHasPathPrefix,
 } from './bundle-cli.ts'
 
@@ -178,6 +179,7 @@ describe('packBundledDirectory', () => {
     expect(listing).toContain('package/lib/bin.js')
     expect(listing).toContain('package/lib/bin.upstream.js')
     expect(listing).toContain('package/lib/deepseek-ai-compat-loader.js')
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
 
     const wrapper = execFileSync('tar', ['-xOzf', packed.file, 'package/lib/bin.js'], { encoding: 'utf8' })
     expect(wrapper).toContain(DEEPSEEK_AI_COMPAT_MARKER)
@@ -198,6 +200,22 @@ describe('packBundledDirectory', () => {
     expect(readFileSync(join(packageDir, 'lib/bin.js'), 'utf8')).toContain(DEEPSEEK_AI_COMPAT_MARKER)
   })
 
+  it('stores hard-linked deploy files as regular members so npm will not E415', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-hardlink-'))
+    writeDeployFixture(packageDir)
+    const a = join(packageDir, 'node_modules/dup-a.js')
+    const b = join(packageDir, 'node_modules/dup-b.js')
+    writeFileSync(a, 'same-bytes\n')
+    linkSync(a, b)
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-hardlink-out-'))
+    const packed = packBundledDirectory(packageDir, out)
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
+    const listing = execFileSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
+    expect(listing).toContain('package/node_modules/dup-a.js')
+    expect(listing).toContain('package/node_modules/dup-b.js')
+    expect(listing).toContain('package/node_modules/@deepseek-ai/cordis')
+  })
+
   it('packs a deploy tree whose tar listing exceeds Node spawnSync maxBuffer', () => {
     const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-enobufs-'))
     writeDeployFixture(packageDir)
@@ -207,6 +225,7 @@ describe('packBundledDirectory', () => {
     const raw = spawnSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
     expect(raw.error).toMatchObject({ code: 'ENOBUFS' })
     expect(tarballHasPathPrefix(packed.file, 'package/node_modules/')).toBe(true)
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
     expect(() => checkAppliedCompat(out)).not.toThrow()
   })
 })
@@ -221,6 +240,22 @@ describe('tarballHasPathPrefix', () => {
     execFileSync('tar', ['-czf', tarball, '-C', root, 'package'])
     expect(tarballHasPathPrefix(tarball, 'package/node_modules/')).toBe(false)
     expect(tarballHasPathPrefix(tarball, 'package/package.json')).toBe(true)
+  })
+})
+
+describe('tarballHasHardLinks', () => {
+  it('detects GNU tar hard-link members and ignores a dereference pack', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-hl-'))
+    const packageDir = join(root, 'package')
+    mkdirSync(packageDir, { recursive: true })
+    writeFileSync(join(packageDir, 'a.txt'), 'payload\n')
+    linkSync(join(packageDir, 'a.txt'), join(packageDir, 'b.txt'))
+    const withLinks = join(root, 'with-links.tgz')
+    execFileSync('tar', ['-czf', withLinks, '-C', root, 'package'])
+    expect(tarballHasHardLinks(withLinks)).toBe(true)
+    const dereferenced = join(root, 'dereferenced.tgz')
+    execFileSync('tar', ['--hard-dereference', '-czf', dereferenced, '-C', root, 'package'])
+    expect(tarballHasHardLinks(dereferenced)).toBe(false)
   })
 })
 
