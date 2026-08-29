@@ -52,13 +52,12 @@
  *    `reconcilePackage`). Official 0.1.2 dropped `packages/client/runtime`.
  *    Third-party 0.1.1 plugins still `require("@deepseek-ai/dsh-client-runtime/client")`.
  *    The packed CLI vendors that 0.1.1-rc.2 factory (not as a cordis Loader
- *    plugin), puts it on `PARSER_PRELOAD_IDS`, and `compose()` inserts a
- *    synthetic table row so the bootstrap combo can register the factory.
- *    Web boot `loader.create`s every returned `entries` id, so that row is
- *    omitted from the wire graph (0.1.1 `apply()` would collide with the
- *    0.1.2 session/workspace controllers). `makeRequire` also looks up
- *    platform seeds after stripping `/client`. `reconcilePackage` must not
- *    delete that row when no Loader source owns the package.
+ *    plugin). `compose()` appends that factory's `ModuleLoader.load` onto the
+ *    `dsh-client-modules` bootstrap bundle so 0.1.1 plugins can require it.
+ *    It cannot be its own graph row: every `__DSH_BOOT__.entries` id is
+ *    `loader.create`d, and every bootstrap batch name must appear in those
+ *    entries. `makeRequire` also looks up platform seeds after stripping
+ *    `/client`.
  * 3. Profile fallback links: the fat CLI strips `@prettier-ai/*` from
  *    `dependencies`, so official `healProfilesModuleFallback` only links the
  *    CLI package itself. The wrapper also symlinks every bundled
@@ -959,19 +958,14 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
           `${filename}: ${modulesIndex} must emit official @deepseek-ai graph ids from 0.1.2 reconcilePackage`,
         )
       }
-      if (body.includes('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')) {
+      if (body.includes('PARSER_PRELOAD_IDS.map((id) => this.table.get(id))') && !body.includes('foldLegacyClientRuntimeFactory')) {
         failures.push(
-          `${filename}: ${modulesIndex} must parser-preload @deepseek-ai/dsh-client-runtime for 0.1.1 plugins`,
+          `${filename}: ${modulesIndex} must fold the vendored dsh-client-runtime factory into the client-modules bootstrap bundle`,
         )
       }
-      if (body.includes('PARSER_PRELOAD_IDS.map((id) => this.table.get(id))') && !body.includes('ensureLegacyClientRuntimeRow')) {
+      if (body.includes('ensureLegacyClientRuntimeRow')) {
         failures.push(
-          `${filename}: ${modulesIndex} must insert a legacy dsh-client-runtime graph row before compose()`,
-        )
-      }
-      if (body.includes('ensureLegacyClientRuntimeRow') && !body.includes('sourceKey !== "legacy-client-runtime"')) {
-        failures.push(
-          `${filename}: ${modulesIndex} must omit the synthetic dsh-client-runtime row from compose() wire entries`,
+          `${filename}: ${modulesIndex} must not insert a synthetic dsh-client-runtime graph row`,
         )
       }
       if (
@@ -1452,19 +1446,94 @@ const CLIENT_MODULE_COMPOSE_WIRE_RETURN = [
 	'\t\t};',
 ].join('\n')
 
+const CLIENT_MODULE_FOLD_LEGACY_RUNTIME = [
+	'\tfoldLegacyClientRuntimeFactory() {',
+	'\t\tconst wireId = "@deepseek-ai/dsh-client-runtime";',
+	'\t\tif (this.table.has(wireId)) return;',
+	'\t\tconst host = this.table.get(CLIENT_MODULES_ID);',
+	'\t\tif (host === void 0) return;',
+	'\t\tconst folded = "prettier-ai:legacy-client-runtime";',
+	'\t\tif (host.bundle.toString("utf8").includes(folded)) return;',
+	'\t\tconst requireFromHere = createRequire(import.meta.url);',
+	'\t\tlet pkgPath;',
+	'\t\ttry {',
+	'\t\t\tpkgPath = requireFromHere.resolve(wireId + "/package.json");',
+	'\t\t} catch {',
+	'\t\t\ttry {',
+	'\t\t\t\tpkgPath = requireFromHere.resolve("@prettier" + "-ai/dsh-client-runtime/package.json");',
+	'\t\t\t} catch {',
+	'\t\t\t\treturn;',
+	'\t\t\t}',
+	'\t\t}',
+	'\t\tconst pkg = JSON.parse(readFileSync(pkgPath, "utf8"));',
+	'\t\tconst pkgName = typeof pkg.name === "string" ? pkg.name : wireId;',
+	'\t\tconst clientRel = clientExportOf(pkgName, pkg.exports);',
+	'\t\tif (clientRel === void 0) return;',
+	'\t\tconst clientPath = join(dirname(pkgPath), clientRel);',
+	'\t\tlet extra;',
+	'\t\ttry {',
+	'\t\t\textra = readFileSync(clientPath);',
+	'\t\t} catch {',
+	'\t\t\treturn;',
+	'\t\t}',
+	'\t\thost.bundle = Buffer.concat([host.bundle, Buffer.from("\\n/* " + folded + " */\\n"), extra]);',
+	'\t}',
+].join('\n')
+
+const CLIENT_MODULE_COMPOSE_WITH_FOLD = [
+	CLIENT_MODULE_FOLD_LEGACY_RUNTIME,
+	'\tcompose() {',
+	'\t\tthis.foldLegacyClientRuntimeFactory();',
+	'\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+	'\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+].join('\n')
+
+const CLIENT_MODULE_COMPOSE_WITH_ENSURE_CALL = [
+	'\tcompose() {',
+	'\t\tthis.ensureLegacyClientRuntimeRow();',
+	'\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+	'\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+].join('\n')
+
+function stripEnsureLegacyClientRuntimeRow(body: string): string {
+  const needle = '\tensureLegacyClientRuntimeRow() {'
+  const start = body.indexOf(needle)
+  if (start === -1) return body
+  let depth = 0
+  let i = start
+  while (i < body.length) {
+    const char = body[i]
+    if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) {
+        let end = i + 1
+        if (body[end] === '\n') end += 1
+        return body.slice(0, start) + body.slice(end)
+      }
+    }
+    i += 1
+  }
+  return body
+}
+
 /**
- * Preload the vendored 0.1.1-rc.2 `dsh-client-runtime` factory on 0.1.2 hosts.
- * Official 0.1.2 `compose()` only emits PARSER_PRELOAD rows that already exist
- * in the table; a Loader-less vendor copy never becomes a source, so compose
- * must insert the row itself. Web boot then `loader.create`s every returned
- * entry, so the synthetic row stays in the table / bootstrap combo and is
- * omitted from wire `entries`.
+ * Register the vendored 0.1.1-rc.2 `dsh-client-runtime` factory on 0.1.2 hosts.
+ * Official 0.1.2 dropped that package; 0.1.1 plugins still
+ * `require("@deepseek-ai/dsh-client-runtime/client")`. The factory must run as
+ * extra `ModuleLoader.load` bytes inside the client-modules bootstrap combo.
+ * A separate graph row cannot work: `parseBootManifest` requires every
+ * bootstrap batch name to appear in `entries`, and web boot `loader.create`s
+ * every entry (0.1.1 `apply()` then collides with the 0.1.2 controllers).
  * @param body - packed `dsh-client-modules/lib/index.js`.
  */
 function applyLegacyClientRuntimeBootstrap(body: string): string {
   let next = body
-  if (next.includes(PARSER_PRELOAD_IDS_SHORT)) {
-    next = next.replace(PARSER_PRELOAD_IDS_SHORT, PARSER_PRELOAD_IDS_WITH_RUNTIME)
+  if (next.includes(PARSER_PRELOAD_IDS_WITH_RUNTIME)) {
+    next = next.replace(PARSER_PRELOAD_IDS_WITH_RUNTIME, PARSER_PRELOAD_IDS_SHORT)
+  }
+  if (next.includes(CLIENT_MODULE_COMPOSE_WIRE_RETURN)) {
+    next = next.replace(CLIENT_MODULE_COMPOSE_WIRE_RETURN, CLIENT_MODULE_COMPOSE_RETURN)
   }
   if (
     next.includes(CLIENT_MODULE_RECONCILE_DELETE_WIRE)
@@ -1472,16 +1541,14 @@ function applyLegacyClientRuntimeBootstrap(body: string): string {
   ) {
     next = next.replace(CLIENT_MODULE_RECONCILE_DELETE_WIRE, CLIENT_MODULE_RECONCILE_DELETE_KEEP_RUNTIME)
   }
-  if (!next.includes('ensureLegacyClientRuntimeRow') && next.includes(CLIENT_MODULE_COMPOSE_HEAD)) {
-    next = next.replace(CLIENT_MODULE_COMPOSE_HEAD, CLIENT_MODULE_COMPOSE_WITH_RUNTIME)
+  if (next.includes(CLIENT_MODULE_COMPOSE_WITH_RUNTIME)) {
+    next = next.replace(CLIENT_MODULE_COMPOSE_WITH_RUNTIME, CLIENT_MODULE_COMPOSE_WITH_FOLD)
+  } else if (next.includes(CLIENT_MODULE_COMPOSE_WITH_ENSURE_CALL)) {
+    next = next.replace(CLIENT_MODULE_COMPOSE_WITH_ENSURE_CALL, CLIENT_MODULE_COMPOSE_WITH_FOLD)
+  } else if (!next.includes('foldLegacyClientRuntimeFactory') && next.includes(CLIENT_MODULE_COMPOSE_HEAD)) {
+    next = next.replace(CLIENT_MODULE_COMPOSE_HEAD, CLIENT_MODULE_COMPOSE_WITH_FOLD)
   }
-  if (
-    next.includes(CLIENT_MODULE_COMPOSE_RETURN)
-    && !next.includes('sourceKey !== "legacy-client-runtime"')
-  ) {
-    next = next.replace(CLIENT_MODULE_COMPOSE_RETURN, CLIENT_MODULE_COMPOSE_WIRE_RETURN)
-  }
-  return next
+  return stripEnsureLegacyClientRuntimeRow(next)
 }
 
 function collectScopedPackageDirs(nodeModulesDir: string): string[] {

@@ -577,10 +577,11 @@ describe('packBundledDirectory', () => {
     expect(modulesIndex).toContain('@deepseek-ai/dsh-client-modules')
     expect(modulesIndex).not.toContain('@prettier-ai/dsh-client-modules')
     expect(modulesIndex).toContain('graphRow(wireId, rev, meta)')
-    expect(modulesIndex).toContain('ensureLegacyClientRuntimeRow')
-    expect(modulesIndex).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
-    expect(modulesIndex).toContain('sourceKey !== "legacy-client-runtime"')
-    expect(modulesIndex).toContain('entries: wireEntries')
+    expect(modulesIndex).toContain('foldLegacyClientRuntimeFactory')
+    expect(modulesIndex).toContain('prettier-ai:legacy-client-runtime')
+    expect(modulesIndex).toContain('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')
+    expect(modulesIndex).not.toContain('ensureLegacyClientRuntimeRow')
+    expect(modulesIndex).not.toContain('entries: wireEntries')
     const modulesClient = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'],
