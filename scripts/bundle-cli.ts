@@ -9,16 +9,15 @@
  * the lockfile, copies production `node_modules` into the tarball, and strips
  * those workspace names from the published manifest.
  *
- * `pnpm deploy` hard-links files from the content-addressable store. GNU tar
- * would store those as hard-link members, and npm then rejects the PUT with
- * `E415 Hard link is not allowed`. Pack with `--hard-dereference` so each
- * member is a regular file.
- *
- * Pack CLI #5 then failed the same PUT with `E415 Symbolic link is not
- * allowed`: `@deepseek-ai/*` aliases were relative symlinks, and leftover
- * `.bin` links are also symlink members. Copy those aliases as real
- * directories and pack with `--dereference` so remaining symlink members
- * become regular files too.
+ * `pnpm deploy` hard-links files from the content-addressable store and leaves
+ * hoisted `@prettier-ai/*` names as symlinks into `.pnpm`. GNU tar would store
+ * those as hard-link / symlink members, and npm then rejects the PUT with
+ * `E415`. Copy the deploy tree with `dereference: true` into a snapshot first
+ * so the archive has only regular files. Node's `cpSync({ dereference: true })`
+ * still leaves file-type symlinks (pnpm `.bin` shims). Walk those after the copy
+ * and replace them with real files. Do not `tar --dereference` a live tree that
+ * still contains `.pnpm` + hoisted directory symlinks: GNU tar then reports
+ * `File removed before we read it` (0.1.2-alpha.1 Pack CLI, schemastery).
  *
  * `pnpm deploy --prod --legacy` may still omit nested workspace packages that
  * only appear as `workspace:^` (or `link:`) edges of vendor packages already
@@ -54,6 +53,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
+  copyFileSync,
   cpSync,
   existsSync,
   globSync,
@@ -492,9 +492,11 @@ export function packBundledDirectory(
   try {
     const parent = join(tmp, 'parent')
     mkdirSync(parent)
-    execFileSync('cp', ['-a', packageDir, join(parent, 'package')])
-    // npm rejects tar hard-link members and symlink members (both E415).
-    execFileSync('tar', ['--hard-dereference', '--dereference', '-czf', file, '-C', parent, 'package'])
+    copyDereferencedSnapshot(packageDir, join(parent, 'package'))
+    // Snapshot has no remaining symlinks. --hard-dereference is belt-and-suspenders
+    // if a copy still shared an inode; do not --dereference (GNU tar races on
+    // hoisted directory symlinks into `.pnpm`).
+    execFileSync('tar', ['--hard-dereference', '-czf', file, '-C', parent, 'package'])
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -787,6 +789,82 @@ function collectNativeOptionalPackageDirs(nodeModulesDir: string): Map<string, s
     if (!found.has(name)) found.set(name, dirname(manifestPath))
   }
   return found
+}
+
+/**
+ * Copy `src` to `dest` as a real directory tree (follow symlinks, duplicate
+ * hard-linked inodes). Used for the tar snapshot so GNU tar does not walk a
+ * live pnpm hoisted graph.
+ * @param src - deploy / injected package directory.
+ * @param dest - empty destination path.
+ */
+function copyDereferencedSnapshot(src: string, dest: string): void {
+  mkdirSync(dirname(dest), { recursive: true })
+  cpSync(src, dest, { recursive: true, dereference: true })
+  flattenRemainingSymlinks(dest)
+}
+
+const SYMLINK_FLATTEN_PASSES = 32
+
+/**
+ * Replace leftover file and directory symlinks with real copies.
+ * Node's recursive `cpSync({ dereference: true })` flattens some directory
+ * links but keeps pnpm `.bin` file shims as `l` members.
+ * @param root - snapshot directory.
+ */
+function flattenRemainingSymlinks(root: string): void {
+  for (let pass = 0; pass < SYMLINK_FLATTEN_PASSES; pass += 1) {
+    const links = collectSymlinkPaths(root)
+    if (links.length === 0) return
+    links.sort((a, b) => a.split('/').length - b.split('/').length)
+    for (const linkPath of links) {
+      try {
+        if (!lstatSync(linkPath).isSymbolicLink()) continue
+      } catch {
+        continue
+      }
+      replaceSymlinkWithRealCopy(linkPath)
+    }
+  }
+  const leftover = collectSymlinkPaths(root)
+  if (leftover.length > 0) {
+    throw new Error(`bundle-cli: snapshot still contains symlink ${leftover[0]}`)
+  }
+}
+
+function collectSymlinkPaths(root: string): string[] {
+  const links: string[] = []
+  walkForSymlinks(root, links)
+  return links
+}
+
+function walkForSymlinks(dir: string, links: string[]): void {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name)
+    const st = lstatSync(full)
+    if (st.isSymbolicLink()) {
+      links.push(full)
+      continue
+    }
+    if (st.isDirectory()) walkForSymlinks(full, links)
+  }
+}
+
+function replaceSymlinkWithRealCopy(linkPath: string): void {
+  let real: string
+  try {
+    real = realpathSync(linkPath)
+  } catch {
+    unlinkSync(linkPath)
+    return
+  }
+  unlinkSync(linkPath)
+  const st = lstatSync(real)
+  if (st.isDirectory()) {
+    cpSync(real, linkPath, { recursive: true, dereference: true })
+    return
+  }
+  copyFileSync(real, linkPath)
 }
 
 function rematerializeDirectory(dir: string): void {
