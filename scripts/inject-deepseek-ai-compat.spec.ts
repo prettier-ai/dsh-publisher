@@ -778,12 +778,12 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(indexJs).toContain('@prettier-ai/cordis')
     expect(indexJs).toContain('graphRow(wireId, rev, meta)')
     expect(indexJs).toContain('entryName.startsWith("@prettier-ai/")')
-    expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
-    expect(indexJs).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
-    expect(indexJs).not.toContain('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')
-    expect(indexJs).toContain('sourceKey !== "legacy-client-runtime"')
-    expect(indexJs).toContain('entries: wireEntries')
-    expect(indexJs).toContain('sourceKey: "legacy-client-runtime"')
+    expect(indexJs).toContain('foldLegacyClientRuntimeFactory')
+    expect(indexJs).toContain('prettier-ai:legacy-client-runtime')
+    expect(indexJs).toContain('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')
+    expect(indexJs).not.toContain('ensureLegacyClientRuntimeRow')
+    expect(indexJs).not.toContain('entries: wireEntries')
+    expect(indexJs).not.toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
 
     const clientJs = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),
@@ -872,14 +872,32 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(restoreOfficialPluginIdentities(dir)).toEqual([])
   })
 
-  it('omits an already-inserted synthetic runtime row from compose wire entries', () => {
-    const dir = makeTemp('dsh-compat-wire-filter-')
+  it('replaces a synthetic runtime graph row overlay with a client-modules factory fold', () => {
+    const dir = makeTemp('dsh-compat-fold-runtime-')
     writeCliFixture(dir)
     writeRescopedClientModules(dir)
-    restoreOfficialPluginIdentities(dir)
     const indexPath = join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/index.js')
     let indexJs = readFileSync(indexPath, 'utf8')
-    expect(indexJs).toContain('sourceKey !== "legacy-client-runtime"')
+    indexJs = indexJs.replace(
+      'const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];',
+      'const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"];',
+    )
+    const composeHead = [
+      '\tcompose() {',
+      '\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+      '\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+    ].join('\n')
+    const staleRow = [
+      '\tensureLegacyClientRuntimeRow() {',
+      '\t\tthis.table.set("@deepseek-ai/dsh-client-runtime", { sourceKey: "legacy-client-runtime" });',
+      '\t}',
+      '\tcompose() {',
+      '\t\tthis.ensureLegacyClientRuntimeRow();',
+      '\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+      '\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+    ].join('\n')
+    expect(indexJs).toContain(composeHead)
+    indexJs = indexJs.replace(composeHead, staleRow)
     const originalReturn = [
       '\t\treturn {',
       '\t\t\trev: shortHash(JSON.stringify({',
@@ -904,17 +922,17 @@ describe('restoreOfficialPluginIdentities', () => {
       '\t\t\tbatches',
       '\t\t};',
     ].join('\n')
-    expect(indexJs).toContain(wireReturn)
-    writeFileSync(indexPath, indexJs.replace(wireReturn, originalReturn))
-    indexJs = readFileSync(indexPath, 'utf8')
+    indexJs = indexJs.replace(originalReturn, wireReturn)
+    writeFileSync(indexPath, indexJs)
     expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
-    expect(indexJs).not.toContain('sourceKey !== "legacy-client-runtime"')
+    expect(indexJs).toContain('entries: wireEntries')
     expect(restoreOfficialPluginIdentities(dir).some(path => path.endsWith('dsh-client-modules/lib/index.js'))).toBe(true)
     indexJs = readFileSync(indexPath, 'utf8')
-    expect(indexJs).toContain('sourceKey !== "legacy-client-runtime"')
-    expect(indexJs).toContain('entries: wireEntries')
-    expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
-    expect(indexJs).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
+    expect(indexJs).toContain('foldLegacyClientRuntimeFactory')
+    expect(indexJs).not.toContain('ensureLegacyClientRuntimeRow')
+    expect(indexJs).not.toContain('entries: wireEntries')
+    expect(indexJs).toContain('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')
+    expect(indexJs).not.toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
   })
 
   it('does not rewrite the CLI package.json when only wire ids change', () => {
