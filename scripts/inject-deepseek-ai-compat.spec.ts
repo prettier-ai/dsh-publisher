@@ -678,6 +678,11 @@ function writeRescopedClientModules(packageDir: string): void {
       '\t\treturn true;',
       '\t}',
       '',
+      'const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];',
+      '\tcompose() {',
+      '\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+      '\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+      '',
     ].join('\n'),
   )
   writeFileSync(
@@ -763,6 +768,9 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(indexJs).toContain('@prettier-ai/cordis')
     expect(indexJs).toContain('graphRow(wireId, rev, meta)')
     expect(indexJs).toContain('entryName.startsWith("@prettier-ai/")')
+    expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
+    expect(indexJs).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
+    expect(indexJs).not.toContain('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')
 
     const clientJs = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),
@@ -773,6 +781,7 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(clientJs).toContain('this.seed.set(alt, val)')
     expect(clientJs).toContain('"@prettier" + "-ai/"')
     expect(clientJs).toContain('altSpec')
+    expect(clientJs).toContain('this.seed.has(id)')
 
     const asset = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'),
@@ -821,6 +830,33 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(indexJs).toContain('graphRow(wireId, rev, source.meta)')
     expect(indexJs).toContain('this.table.set(wireId, {')
     expect(indexJs).not.toContain('graphRow(packageName, rev, source.meta)')
+    expect(indexJs).toContain('wireId === "@deepseek-ai/dsh-client-runtime"')
+    expect(indexJs).not.toContain('return this.table.delete(packageName)')
+  })
+
+  it('looks up platform seeds after stripping /client on an already-aliased makeRequire', () => {
+    const dir = makeTemp('dsh-compat-seed-strip-')
+    writeCliFixture(dir)
+    writeRescopedClientModules(dir)
+    restoreOfficialPluginIdentities(dir)
+    const clientPath = join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js')
+    let clientJs = readFileSync(clientPath, 'utf8')
+    clientJs = clientJs.replace(
+      '\t\t\t\t\tif (this.seed.has(id)) return this.seed.get(id);\n'
+      + '\t\t\t\t\tif (altId !== id && this.seed.has(altId)) return this.seed.get(altId);\n',
+      '',
+    )
+    clientJs = clientJs.replace(
+      '\t\t\t\tif (this.seed.has(id)) return this.seed.get(id);\n'
+      + '\t\t\t\tif (altId !== id && this.seed.has(altId)) return this.seed.get(altId);\n',
+      '',
+    )
+    writeFileSync(clientPath, clientJs)
+    expect(clientJs).toContain('altSpec')
+    expect(clientJs).not.toContain('this.seed.has(id)')
+    expect(restoreOfficialPluginIdentities(dir).some(path => path.endsWith('lib/client.js'))).toBe(true)
+    expect(readFileSync(clientPath, 'utf8')).toContain('this.seed.has(id)')
+    expect(restoreOfficialPluginIdentities(dir)).toEqual([])
   })
 
   it('does not rewrite the CLI package.json when only wire ids change', () => {

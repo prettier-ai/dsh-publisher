@@ -49,7 +49,13 @@
  *    `name` fields stay `@prettier-ai/*` (typert requires Loader name ===
  *    package.json `name`). The client-modules scan then emits `@deepseek-ai/*`
  *    graph row ids from those Loader names (0.1.1-rc.2 `processOne`, 0.1.2
- *    `reconcilePackage`).
+ *    `reconcilePackage`). Official 0.1.2 dropped `packages/client/runtime`.
+ *    Third-party 0.1.1 plugins still `require("@deepseek-ai/dsh-client-runtime/client")`.
+ *    The packed CLI vendors that 0.1.1-rc.2 factory (not as a cordis Loader
+ *    plugin), puts it on `PARSER_PRELOAD_IDS`, and `compose()` inserts a
+ *    synthetic table row. `makeRequire` also looks up platform seeds after
+ *    stripping `/client`. `reconcilePackage` must not delete that row when no
+ *    Loader source owns the package.
  * 3. Profile fallback links: the fat CLI strips `@prettier-ai/*` from
  *    `dependencies`, so official `healProfilesModuleFallback` only links the
  *    CLI package itself. The wrapper also symlinks every bundled
@@ -950,6 +956,25 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
           `${filename}: ${modulesIndex} must emit official @deepseek-ai graph ids from 0.1.2 reconcilePackage`,
         )
       }
+      if (body.includes('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')) {
+        failures.push(
+          `${filename}: ${modulesIndex} must parser-preload @deepseek-ai/dsh-client-runtime for 0.1.1 plugins`,
+        )
+      }
+      if (body.includes('PARSER_PRELOAD_IDS.map((id) => this.table.get(id))') && !body.includes('ensureLegacyClientRuntimeRow')) {
+        failures.push(
+          `${filename}: ${modulesIndex} must insert a legacy dsh-client-runtime graph row before compose()`,
+        )
+      }
+      if (
+        body.includes('reconcilePackage(packageName)')
+        && body.includes('this.table.delete(wireId)')
+        && !body.includes('wireId === "@deepseek-ai/dsh-client-runtime"')
+      ) {
+        failures.push(
+          `${filename}: ${modulesIndex} must keep the synthetic dsh-client-runtime row in reconcilePackage`,
+        )
+      }
     }
   }
   const modulesClient = 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'
@@ -969,6 +994,11 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
       if (body.includes('makeRequire(edges)') && !body.includes('altSpec')) {
         failures.push(
           `${filename}: ${modulesClient} must look up the other scope in makeRequire/import`,
+        )
+      }
+      if (body.includes('makeRequire(edges)') && body.includes('altSpec') && !body.includes('this.seed.has(id)')) {
+        failures.push(
+          `${filename}: ${modulesClient} must look up platform seeds after stripping /client`,
         )
       }
     }
@@ -1109,7 +1139,10 @@ const CLIENT_MODULE_RECONCILE_PACKAGE_WIRE = [
 	'\t\t\tthrow new Error(`client-modules: package ${packageName} resolves from multiple active Loader sources: ${locations}; remove one entry`);',
 	'\t\t}',
 	'\t\tconst source = sources[0];',
-	'\t\tif (source === void 0) return this.table.delete(wireId);',
+	'\t\tif (source === void 0) {',
+	'\t\t\tif (wireId === "@deepseek-ai/dsh-client-runtime") return false;',
+	'\t\t\treturn this.table.delete(wireId);',
+	'\t\t}',
 	'\t\tif (this.table.get(wireId)?.sourceKey === source.sourceKey) return false;',
 	'\t\tconst snapshot = this.initialBundleSnapshot(packageName, source.meta.clientPath);',
 	'\t\tconst rev = this.allocateInitialRevision();',
@@ -1163,6 +1196,8 @@ const CLIENT_MODULE_MAKE_REQUIRE_ALIASED = [
 	'\t\t\t\t\tif (altSpec !== spec && this.seed.has(altSpec)) return this.seed.get(altSpec);',
 	'\t\t\t\t\tconst id = stripClientSuffix(spec);',
 	'\t\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\t\tif (this.seed.has(id)) return this.seed.get(id);',
+	'\t\t\t\t\tif (altId !== id && this.seed.has(altId)) return this.seed.get(altId);',
 	'\t\t\t\t\tconst record = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
 	'\t\t\t\t\tif (record !== void 0) return record.exports;',
 	'\t\t\t\t\tif (this.factories.has(id)) return this.materialize(id).exports;',
@@ -1178,6 +1213,8 @@ const CLIENT_MODULE_MAKE_REQUIRE_ALIASED = [
 	'\t\t\t\tif (altSpec !== specifier && this.seed.has(altSpec)) return this.seed.get(altSpec);',
 	'\t\t\t\tconst id = stripClientSuffix(specifier);',
 	'\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\tif (this.seed.has(id)) return this.seed.get(id);',
+	'\t\t\t\tif (altId !== id && this.seed.has(altId)) return this.seed.get(altId);',
 	'\t\t\t\tconst existing = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
 	'\t\t\t\tif (existing !== void 0) return existing.exports;',
 	'\t\t\t\tconst row = this.graphRows.get(id) ?? (altId !== id ? this.graphRows.get(altId) : void 0);',
@@ -1235,10 +1272,60 @@ function rewriteClientModuleSeedAliases(path: string): boolean {
 function rewriteClientModuleRequireAliases(path: string): boolean {
   if (!existsSync(path)) return false
   const before = readFileSync(path, 'utf8')
-  if (before.includes('altSpec')) return false
-  if (!before.includes(CLIENT_MODULE_MAKE_REQUIRE)) return false
-  writeFileSync(path, before.replace(CLIENT_MODULE_MAKE_REQUIRE, CLIENT_MODULE_MAKE_REQUIRE_ALIASED))
+  let body = before
+  if (!body.includes('altSpec') && body.includes(CLIENT_MODULE_MAKE_REQUIRE)) {
+    body = body.replace(CLIENT_MODULE_MAKE_REQUIRE, CLIENT_MODULE_MAKE_REQUIRE_ALIASED)
+  }
+  body = rewriteClientModuleSeedAfterStrip(body)
+  if (body === before) return false
+  writeFileSync(path, body)
   return true
+}
+
+/** Official `makeRequire` looks up seeds with the exact specifier, then strips `/client` and never consults the seed Map again. */
+const CLIENT_MODULE_REQUIRE_AFTER_STRIP = [
+	'\t\t\t\t\tconst id = stripClientSuffix(spec);',
+	'\t\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\t\tconst record = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
+].join('\n')
+
+const CLIENT_MODULE_REQUIRE_AFTER_STRIP_SEEDED = [
+	'\t\t\t\t\tconst id = stripClientSuffix(spec);',
+	'\t\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\t\tif (this.seed.has(id)) return this.seed.get(id);',
+	'\t\t\t\t\tif (altId !== id && this.seed.has(altId)) return this.seed.get(altId);',
+	'\t\t\t\t\tconst record = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
+].join('\n')
+
+const CLIENT_MODULE_IMPORT_AFTER_STRIP = [
+	'\t\t\t\tconst id = stripClientSuffix(specifier);',
+	'\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\tconst existing = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
+].join('\n')
+
+const CLIENT_MODULE_IMPORT_AFTER_STRIP_SEEDED = [
+	'\t\t\t\tconst id = stripClientSuffix(specifier);',
+	'\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\tif (this.seed.has(id)) return this.seed.get(id);',
+	'\t\t\t\tif (altId !== id && this.seed.has(altId)) return this.seed.get(altId);',
+	'\t\t\t\tconst existing = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
+].join('\n')
+
+/**
+ * After `/client` is stripped, look up the seed Map again.
+ * Platform keys are the bare package name; `require("@pkg/client")` misses an exact-key seed lookup.
+ * @param body - packed `dsh-client-modules/lib/client.js`.
+ */
+function rewriteClientModuleSeedAfterStrip(body: string): string {
+  if (body.includes('this.seed.has(id)')) return body
+  let next = body
+  if (next.includes(CLIENT_MODULE_REQUIRE_AFTER_STRIP)) {
+    next = next.replace(CLIENT_MODULE_REQUIRE_AFTER_STRIP, CLIENT_MODULE_REQUIRE_AFTER_STRIP_SEEDED)
+  }
+  if (next.includes(CLIENT_MODULE_IMPORT_AFTER_STRIP)) {
+    next = next.replace(CLIENT_MODULE_IMPORT_AFTER_STRIP, CLIENT_MODULE_IMPORT_AFTER_STRIP_SEEDED)
+  }
+  return next
 }
 
 /**
@@ -1257,9 +1344,102 @@ function rewriteClientModuleGraphIds(path: string): boolean {
   if (body.includes(CLIENT_MODULE_RECONCILE_PACKAGE)) {
     body = body.replace(CLIENT_MODULE_RECONCILE_PACKAGE, CLIENT_MODULE_RECONCILE_PACKAGE_WIRE)
   }
+  body = applyLegacyClientRuntimeBootstrap(body)
   if (body === before) return false
   writeFileSync(path, body)
   return true
+}
+
+const PARSER_PRELOAD_IDS_SHORT = 'const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];'
+const PARSER_PRELOAD_IDS_WITH_RUNTIME = 'const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"];'
+
+const CLIENT_MODULE_RECONCILE_DELETE_WIRE = '\t\tif (source === void 0) return this.table.delete(wireId);'
+const CLIENT_MODULE_RECONCILE_DELETE_KEEP_RUNTIME = [
+	'\t\tif (source === void 0) {',
+	'\t\t\tif (wireId === "@deepseek-ai/dsh-client-runtime") return false;',
+	'\t\t\treturn this.table.delete(wireId);',
+	'\t\t}',
+].join('\n')
+
+const CLIENT_MODULE_COMPOSE_HEAD = [
+	'\tcompose() {',
+	'\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+	'\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+].join('\n')
+
+const CLIENT_MODULE_ENSURE_LEGACY_RUNTIME_ROW = [
+	'\tensureLegacyClientRuntimeRow() {',
+	'\t\tconst wireId = "@deepseek-ai/dsh-client-runtime";',
+	'\t\tif (this.table.has(wireId)) return;',
+	'\t\tconst requireFromHere = createRequire(import.meta.url);',
+	'\t\tlet pkgPath;',
+	'\t\ttry {',
+	'\t\t\tpkgPath = requireFromHere.resolve(wireId + "/package.json");',
+	'\t\t} catch {',
+	'\t\t\ttry {',
+	'\t\t\t\tpkgPath = requireFromHere.resolve("@prettier" + "-ai/dsh-client-runtime/package.json");',
+	'\t\t\t} catch {',
+	'\t\t\t\treturn;',
+	'\t\t\t}',
+	'\t\t}',
+	'\t\tconst pkg = JSON.parse(readFileSync(pkgPath, "utf8"));',
+	'\t\tconst pkgName = typeof pkg.name === "string" ? pkg.name : wireId;',
+	'\t\tconst dsh = pkg.dsh;',
+	'\t\tconst decl = parseDshClient(pkgName, dsh !== null && typeof dsh === "object" ? dsh.client : void 0);',
+	'\t\tif (decl === void 0 || decl.platform !== "web") return;',
+	'\t\tconst clientRel = clientExportOf(pkgName, pkg.exports);',
+	'\t\tif (clientRel === void 0) return;',
+	'\t\tconst clientPath = join(dirname(pkgPath), clientRel);',
+	'\t\tconst snapshot = this.initialBundleSnapshot(pkgName, clientPath);',
+	'\t\tconst rev = this.allocateInitialRevision();',
+	'\t\tconst meta = {',
+	'\t\t\tclientPath,',
+	'\t\t\t...decl.inject !== void 0 ? { inject: decl.inject } : {},',
+	'\t\t\texternal: decl.external ?? [],',
+	'\t\t\timmediately: true',
+	'\t\t};',
+	'\t\tthis.table.set(wireId, {',
+	'\t\t\tentry: graphRow(wireId, rev, meta),',
+	'\t\t\tloaderName: wireId,',
+	'\t\t\tsourceKey: "legacy-client-runtime",',
+	'\t\t\tmeta,',
+	'\t\t\tbundle: snapshot.bundle,',
+	'\t\t\tbaseline: snapshot.baseline,',
+	'\t\t\t...snapshot.sourceMap === void 0 ? {} : { sourceMap: snapshot.sourceMap }',
+	'\t\t});',
+	'\t}',
+].join('\n')
+
+const CLIENT_MODULE_COMPOSE_WITH_RUNTIME = [
+	CLIENT_MODULE_ENSURE_LEGACY_RUNTIME_ROW,
+	'\tcompose() {',
+	'\t\tthis.ensureLegacyClientRuntimeRow();',
+	'\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+	'\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+].join('\n')
+
+/**
+ * Preload the vendored 0.1.1-rc.2 `dsh-client-runtime` factory on 0.1.2 hosts.
+ * Official 0.1.2 `compose()` only emits PARSER_PRELOAD rows that already exist
+ * in the table; a Loader-less vendor copy never becomes a source, so compose
+ * must insert the row itself.
+ * @param body - packed `dsh-client-modules/lib/index.js`.
+ */
+function applyLegacyClientRuntimeBootstrap(body: string): string {
+  let next = body
+  if (next.includes(PARSER_PRELOAD_IDS_SHORT)) {
+    next = next.replace(PARSER_PRELOAD_IDS_SHORT, PARSER_PRELOAD_IDS_WITH_RUNTIME)
+  }
+  if (
+    next.includes(CLIENT_MODULE_RECONCILE_DELETE_WIRE)
+    && !next.includes('wireId === "@deepseek-ai/dsh-client-runtime"')
+  ) {
+    next = next.replace(CLIENT_MODULE_RECONCILE_DELETE_WIRE, CLIENT_MODULE_RECONCILE_DELETE_KEEP_RUNTIME)
+  }
+  if (!next.includes('ensureLegacyClientRuntimeRow') && next.includes(CLIENT_MODULE_COMPOSE_HEAD)) {
+    next = next.replace(CLIENT_MODULE_COMPOSE_HEAD, CLIENT_MODULE_COMPOSE_WITH_RUNTIME)
+  }
+  return next
 }
 
 function collectScopedPackageDirs(nodeModulesDir: string): string[] {

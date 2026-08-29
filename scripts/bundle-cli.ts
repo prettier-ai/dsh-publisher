@@ -42,7 +42,12 @@
  * `$DSH_HOME/profiles/node_modules` with those bundled directories so CJS
  * `createRequire(profile)` can see host plugins. Alias copies stamp
  * `package.json` `name` back to `@deepseek-ai/<name>`; published-scope copies
- * keep `@prettier-ai/<name>`.
+ * keep `@prettier-ai/<name>`. Official 0.1.2 dropped
+ * `@deepseek-ai/dsh-client-runtime`. Production pack vendors
+ * `@deepseek-ai/dsh-client-runtime@0.1.1-rc.2` under
+ * `node_modules/@prettier-ai/dsh-client-runtime` (not listed on CLI
+ * `dependencies`) so 0.1.1 plugins can still require that factory. Unit tests
+ * leave `vendorLegacyClientRuntime` off unless they pass a local tarball.
  *
  * Usage:
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm-cli
@@ -109,7 +114,18 @@ export interface PackBundledOptions {
   readonly version?: string | undefined
   /** Extra `node_modules` to copy native optional packages from (unit-test stub). */
   readonly nativeModules?: string | undefined
+  /**
+   * Vendor `@deepseek-ai/dsh-client-runtime@0.1.1-rc.2` when the deploy tree
+   * has no client factory. Production pack sets this; unit tests leave it off
+   * so they do not hit the network.
+   */
+  readonly vendorLegacyClientRuntime?: boolean | undefined
+  /** Local tarball for tests. Production pack omits this and runs `npm pack`. */
+  readonly legacyClientRuntimeTarball?: string | undefined
 }
+
+/** Last official client-runtime that third-party 0.1.1 plugins still require. */
+export const LEGACY_CLIENT_RUNTIME_SPEC = '@deepseek-ai/dsh-client-runtime@0.1.1-rc.2'
 
 /**
  * Workspace / official-scope names that make npm resolve the peer graph.
@@ -432,6 +448,82 @@ export function materializeDeepseekAiAliases(nodeModulesDir: string): readonly s
 }
 
 /**
+ * Unpack a `dsh-client-runtime` tarball into the published-scope slot.
+ * Does not list the package on the CLI manifest.
+ * @param packageDir - unpacked CLI package directory.
+ * @param tarball - npm pack of `@deepseek-ai/dsh-client-runtime`.
+ */
+export function installLegacyClientRuntimeTarball(packageDir: string, tarball: string): void {
+  const dest = join(packageDir, 'node_modules/@prettier-ai/dsh-client-runtime')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-legacy-runtime-'))
+  try {
+    execFileSync('tar', ['-xzf', tarball, '-C', tmp])
+    const extracted = join(tmp, 'package')
+    if (!existsSync(join(extracted, 'package.json'))) {
+      throw new Error(`bundle-cli: ${tarball} has no package/package.json`)
+    }
+    mkdirSync(join(packageDir, 'node_modules/@prettier-ai'), { recursive: true })
+    if (existsSync(dest)) rmSync(dest, { recursive: true, force: true })
+    cpSync(extracted, dest, { recursive: true, dereference: true })
+    stampPublishedRuntimeName(dest)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+  if (!existsSync(join(dest, 'lib/client.js'))) {
+    throw new Error('bundle-cli: vendored @prettier-ai/dsh-client-runtime is missing lib/client.js')
+  }
+}
+
+function stampPublishedRuntimeName(packageDir: string): void {
+  const manifestPath = join(packageDir, 'package.json')
+  const manifest = readJsonObject(manifestPath)
+  if (manifest.name === '@prettier-ai/dsh-client-runtime') return
+  manifest.name = '@prettier-ai/dsh-client-runtime'
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+}
+
+/**
+ * Copy 0.1.1-rc.2 `dsh-client-runtime` into the fat CLI when official 0.1.2
+ * omitted it. Skips when `lib/client.js` is already present (0.1.1 packs).
+ * @param packageDir - unpacked CLI package directory.
+ * @param tarball - optional local tarball; `npm pack` when omitted.
+ * @returns whether a copy was installed.
+ */
+export function vendorLegacyClientRuntime(packageDir: string, tarball?: string | undefined): boolean {
+  const dest = join(packageDir, 'node_modules/@prettier-ai/dsh-client-runtime')
+  if (existsSync(join(dest, 'lib/client.js'))) return false
+  if (tarball !== undefined && tarball !== '') {
+    installLegacyClientRuntimeTarball(packageDir, tarball)
+    return true
+  }
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-npm-pack-runtime-'))
+  try {
+    const packed = spawnSync('npm', ['pack', LEGACY_CLIENT_RUNTIME_SPEC, '--pack-destination', tmp], {
+      encoding: 'utf8',
+    })
+    if (packed.status !== 0) {
+      const detail = packed.stderr !== undefined && packed.stderr !== ''
+        ? packed.stderr
+        : packed.error instanceof Error
+          ? packed.error.message
+          : `status ${String(packed.status)}`
+      throw new Error(`bundle-cli: npm pack ${LEGACY_CLIENT_RUNTIME_SPEC} failed: ${detail}`)
+    }
+    const files = readdirSync(tmp).filter(name => name.endsWith('.tgz'))
+    const packedTarball = files[0]
+    if (files.length !== 1 || packedTarball === undefined) {
+      throw new Error(
+        `bundle-cli: npm pack ${LEGACY_CLIENT_RUNTIME_SPEC} produced ${String(files.length)} tarball(s)`,
+      )
+    }
+    installLegacyClientRuntimeTarball(packageDir, join(tmp, packedTarball))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+  return true
+}
+
+/**
  * Loader `entry.options.name` is still `@deepseek-ai/<name>`. Official 0.1.2
  * `nearestPackage` requires package.json `name` to match that id.
  * @param packageDir - `node_modules/@deepseek-ai/<name>`.
@@ -473,6 +565,12 @@ export function packBundledDirectory(
     ?? (workspaceRoot !== undefined && workspaceRoot !== '' ? join(workspaceRoot, 'node_modules') : undefined)
   if (nativeModules !== undefined && nativeModules !== '') {
     copyNativeOptionalPackages(packageDir, nativeModules)
+  }
+  if (options.vendorLegacyClientRuntime === true) {
+    const vendored = vendorLegacyClientRuntime(packageDir, options.legacyClientRuntimeTarball)
+    if (vendored) {
+      console.log(`bundle-cli: vendored @prettier-ai/dsh-client-runtime from ${LEGACY_CLIENT_RUNTIME_SPEC}`)
+    }
   }
   const publishedVersion = options.version
   if (publishedVersion !== undefined && publishedVersion !== '') {
@@ -571,7 +669,11 @@ export function deployAndBundleCli(
     if (natives.length > 0) {
       console.log(`bundle-cli: copied ${String(natives.length)} native optional package(s)`)
     }
-    return packBundledDirectory(packageDir, outDir, { workspace, version: publishedVersion })
+    return packBundledDirectory(packageDir, outDir, {
+      workspace,
+      version: publishedVersion,
+      vendorLegacyClientRuntime: true,
+    })
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

@@ -28,8 +28,10 @@ import {
   fillMissingWorkspacePackages,
   isNativeOptionalPackageName,
   isPublishedGraphDependency,
+  installLegacyClientRuntimeTarball,
   materializeDeepseekAiAliases,
   packBundledDirectory,
+  vendorLegacyClientRuntime,
   parsePnpmWorkspacePackageGlobs,
   PNPM_SUPPORTED_ARCHITECTURES,
   prettierAiDshStarDependencyNames,
@@ -121,6 +123,11 @@ function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, stri
       '\t\t});',
       '\t\treturn true;',
       '\t}',
+      '',
+      'const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];',
+      '\tcompose() {',
+      '\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
+      '\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
       '',
     ].join('\n'),
   )
@@ -215,6 +222,25 @@ function writeMiniWorkspace(root: string): void {
   }, null, 2)}\n`)
 }
 
+
+function writeLegacyRuntimeTarball(dir: string): string {
+  const pkg = join(dir, 'package')
+  mkdirSync(join(pkg, 'lib'), { recursive: true })
+  writeFileSync(join(pkg, 'package.json'), `${JSON.stringify({
+    name: '@deepseek-ai/dsh-client-runtime',
+    version: '0.1.1-rc.2',
+    type: 'module',
+    exports: { './client': { default: './lib/client.js' } },
+    dsh: { client: { platform: 'web', immediately: true } },
+  }, null, 2)}\n`)
+  writeFileSync(
+    join(pkg, 'lib/client.js'),
+    'window.__ModuleLoader__.load({ id: "@deepseek-ai/dsh-client-runtime", factory: () => ({ ok: true }) })\n',
+  )
+  const tarball = join(dir, 'runtime.tgz')
+  execFileSync('tar', ['-czf', tarball, '-C', dir, 'package'])
+  return tarball
+}
 
 function writeNativeStub(nodeModules: string, name: string, file = 'index.js'): void {
   const dir = join(nodeModules, ...name.split('/'))
@@ -541,6 +567,8 @@ describe('packBundledDirectory', () => {
     expect(modulesIndex).toContain('@deepseek-ai/dsh-client-modules')
     expect(modulesIndex).not.toContain('@prettier-ai/dsh-client-modules')
     expect(modulesIndex).toContain('graphRow(wireId, rev, meta)')
+    expect(modulesIndex).toContain('ensureLegacyClientRuntimeRow')
+    expect(modulesIndex).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
     const modulesClient = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'],
@@ -551,6 +579,7 @@ describe('packBundledDirectory', () => {
     expect(modulesClient).toContain('this.seed.set(alt, val)')
     expect(modulesClient).toContain('"@prettier" + "-ai/"')
     expect(modulesClient).toContain('altSpec')
+    expect(modulesClient).toContain('this.seed.has(id)')
     const frontendAsset = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'],
@@ -568,6 +597,66 @@ describe('packBundledDirectory', () => {
     expect(wrapper).toContain(DEEPSEEK_AI_COMPAT_MARKER)
     expect(wrapper).toContain('function healHostPackageFallback')
     expect(() => checkAppliedCompat(out)).not.toThrow()
+  })
+
+  it('vendors 0.1.1-rc.2 dsh-client-runtime from a local tarball when packing', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-runtime-'))
+    writeDeployFixture(packageDir)
+    const tarball = writeLegacyRuntimeTarball(mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-runtime-tgz-')))
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-runtime-out-'))
+    const packed = packBundledDirectory(packageDir, out, {
+      vendorLegacyClientRuntime: true,
+      legacyClientRuntimeTarball: tarball,
+    })
+    const listing = execFileSync('tar', ['-tzf', packed.file], { encoding: 'utf8' })
+    expect(listing).toContain('package/node_modules/@prettier-ai/dsh-client-runtime/lib/client.js')
+    expect(listing).toContain('package/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js')
+    const published = JSON.parse(
+      execFileSync(
+        'tar',
+        ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-runtime/package.json'],
+        { encoding: 'utf8' },
+      ),
+    ) as { name: string }
+    expect(published.name).toBe('@prettier-ai/dsh-client-runtime')
+    const alias = JSON.parse(
+      execFileSync(
+        'tar',
+        ['-xOzf', packed.file, 'package/node_modules/@deepseek-ai/dsh-client-runtime/package.json'],
+        { encoding: 'utf8' },
+      ),
+    ) as { name: string }
+    expect(alias.name).toBe('@deepseek-ai/dsh-client-runtime')
+    const manifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/package.json'], { encoding: 'utf8' }),
+    ) as { dependencies?: Record<string, string> }
+    expect(manifest.dependencies).toBeUndefined()
+    expect(() => checkAppliedCompat(out)).not.toThrow()
+  })
+
+  it('does not re-vendor dsh-client-runtime when lib/client.js is already present', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-runtime-skip-'))
+    writeDeployFixture(packageDir)
+    const existing = join(packageDir, 'node_modules/@prettier-ai/dsh-client-runtime')
+    mkdirSync(join(existing, 'lib'), { recursive: true })
+    writeFileSync(join(existing, 'package.json'), `${JSON.stringify({
+      name: '@prettier-ai/dsh-client-runtime',
+      version: 'already-there',
+    }, null, 2)}\n`)
+    writeFileSync(join(existing, 'lib/client.js'), 'export const already = true\n')
+    expect(vendorLegacyClientRuntime(packageDir, '/no-such.tgz')).toBe(false)
+    expect(readFileSync(join(existing, 'lib/client.js'), 'utf8')).toBe('export const already = true\n')
+  })
+
+  it('installs a local runtime tarball under the published scope', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-runtime-install-'))
+    mkdirSync(join(packageDir, 'node_modules'), { recursive: true })
+    const tarball = writeLegacyRuntimeTarball(mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-runtime-install-tgz-')))
+    installLegacyClientRuntimeTarball(packageDir, tarball)
+    const dest = join(packageDir, 'node_modules/@prettier-ai/dsh-client-runtime')
+    const manifest = JSON.parse(readFileSync(join(dest, 'package.json'), 'utf8')) as { name: string }
+    expect(manifest.name).toBe('@prettier-ai/dsh-client-runtime')
+    expect(readFileSync(join(dest, 'lib/client.js'), 'utf8')).toContain('dsh-client-runtime')
   })
 
   it('packs a pnpm-hoisted schemastery symlink as a real directory', () => {
