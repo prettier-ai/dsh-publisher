@@ -682,6 +682,16 @@ function writeRescopedClientModules(packageDir: string): void {
       '\tcompose() {',
       '\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
       '\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+      '\t\tconst batches = [];',
+      '\t\treturn {',
+      '\t\t\trev: shortHash(JSON.stringify({',
+      '\t\t\t\tentries,',
+      '\t\t\t\tbatches',
+      '\t\t\t})),',
+      '\t\t\tentries,',
+      '\t\t\tbatches',
+      '\t\t};',
+      '\t}',
       '',
     ].join('\n'),
   )
@@ -771,6 +781,9 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
     expect(indexJs).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
     expect(indexJs).not.toContain('const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID];')
+    expect(indexJs).toContain('sourceKey !== "legacy-client-runtime"')
+    expect(indexJs).toContain('entries: wireEntries')
+    expect(indexJs).toContain('sourceKey: "legacy-client-runtime"')
 
     const clientJs = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),
@@ -857,6 +870,51 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(restoreOfficialPluginIdentities(dir).some(path => path.endsWith('lib/client.js'))).toBe(true)
     expect(readFileSync(clientPath, 'utf8')).toContain('this.seed.has(id)')
     expect(restoreOfficialPluginIdentities(dir)).toEqual([])
+  })
+
+  it('omits an already-inserted synthetic runtime row from compose wire entries', () => {
+    const dir = makeTemp('dsh-compat-wire-filter-')
+    writeCliFixture(dir)
+    writeRescopedClientModules(dir)
+    restoreOfficialPluginIdentities(dir)
+    const indexPath = join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/index.js')
+    let indexJs = readFileSync(indexPath, 'utf8')
+    expect(indexJs).toContain('sourceKey !== "legacy-client-runtime"')
+    const originalReturn = [
+      '\t\treturn {',
+      '\t\t\trev: shortHash(JSON.stringify({',
+      '\t\t\t\tentries,',
+      '\t\t\t\tbatches',
+      '\t\t\t})),',
+      '\t\t\tentries,',
+      '\t\t\tbatches',
+      '\t\t};',
+    ].join('\n')
+    const wireReturn = [
+      '\t\tconst wireEntries = entries.filter((entry) => {',
+      '\t\t\tif (entry.id !== "@deepseek-ai/dsh-client-runtime") return true;',
+      '\t\t\treturn this.table.get(entry.id)?.sourceKey !== "legacy-client-runtime";',
+      '\t\t});',
+      '\t\treturn {',
+      '\t\t\trev: shortHash(JSON.stringify({',
+      '\t\t\t\tentries: wireEntries,',
+      '\t\t\t\tbatches',
+      '\t\t\t})),',
+      '\t\t\tentries: wireEntries,',
+      '\t\t\tbatches',
+      '\t\t};',
+    ].join('\n')
+    expect(indexJs).toContain(wireReturn)
+    writeFileSync(indexPath, indexJs.replace(wireReturn, originalReturn))
+    indexJs = readFileSync(indexPath, 'utf8')
+    expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
+    expect(indexJs).not.toContain('sourceKey !== "legacy-client-runtime"')
+    expect(restoreOfficialPluginIdentities(dir).some(path => path.endsWith('dsh-client-modules/lib/index.js'))).toBe(true)
+    indexJs = readFileSync(indexPath, 'utf8')
+    expect(indexJs).toContain('sourceKey !== "legacy-client-runtime"')
+    expect(indexJs).toContain('entries: wireEntries')
+    expect(indexJs).toContain('ensureLegacyClientRuntimeRow')
+    expect(indexJs).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
   })
 
   it('does not rewrite the CLI package.json when only wire ids change', () => {
