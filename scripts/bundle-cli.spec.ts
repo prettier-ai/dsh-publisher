@@ -104,6 +104,24 @@ function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, stri
       'export const CLIENT_MODULES_ID = "@prettier-ai/dsh-client-modules"',
       'export const CLIENT_RUNTIME_ID = "@prettier-ai/dsh-client-runtime"',
       '',
+      '\tprocessOne(entryName) {',
+      '\t\tlet qualifies = false;',
+      '\t\tfor (const entry of this.ctx.loader.entries()) if (entry.options.name === entryName && entry.fiber !== void 0 && !entry.disabled) {',
+      '\t\t\tqualifies = true;',
+      '\t\t\tbreak;',
+      '\t\t}',
+      '\t\tif (!qualifies) return this.table.delete(entryName);',
+      '\t\tif (this.table.has(entryName)) return false;',
+      '\t\tconst meta = this.resolveMeta(entryName);',
+      '\t\tif (meta === null) return false;',
+      '\t\tconst rev = this.initialBundleRevision(entryName, meta.clientPath);',
+      '\t\tthis.table.set(entryName, {',
+      '\t\t\tentry: graphRow(entryName, rev, meta),',
+      '\t\t\tmeta',
+      '\t\t});',
+      '\t\treturn true;',
+      '\t}',
+      '',
     ].join('\n'),
   )
   writeFileSync(
@@ -494,6 +512,7 @@ describe('packBundledDirectory', () => {
     )
     expect(modulesIndex).toContain('@deepseek-ai/dsh-client-modules')
     expect(modulesIndex).not.toContain('@prettier-ai/dsh-client-modules')
+    expect(modulesIndex).toContain('graphRow(wireId, rev, meta)')
     const modulesClient = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'],
@@ -516,6 +535,7 @@ describe('packBundledDirectory', () => {
 
     const wrapper = execFileSync('tar', ['-xOzf', packed.file, 'package/lib/bin.js'], { encoding: 'utf8' })
     expect(wrapper).toContain(DEEPSEEK_AI_COMPAT_MARKER)
+    expect(wrapper).toContain('function healHostPackageFallback')
     expect(() => checkAppliedCompat(out)).not.toThrow()
   })
 

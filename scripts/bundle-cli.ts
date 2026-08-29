@@ -39,11 +39,11 @@
  * The packed bin stays `dsh` at `lib/bin.js`. This script does not add `dshp`.
  * Host-side `@deepseek-ai/*` compatibility is applied to the deploy directory
  * (runtime loader) before packing. Install-time npm aliases are not written:
- * they would put `@prettier-ai/*` back on `dependencies`. Physical
- * `@deepseek-ai/*` directories inside bundled `node_modules` cover profile
- * `resolve.paths` instead. Alias copies stamp `package.json` `name` back to
- * `@deepseek-ai/<name>` so Loader ids match; published-scope copies keep
- * `@prettier-ai/<name>`.
+ * they would put `@prettier-ai/*` back on `dependencies`. The wrapper heals
+ * `$DSH_HOME/profiles/node_modules` with those bundled directories so CJS
+ * `createRequire(profile)` can see host plugins. Alias copies stamp
+ * `package.json` `name` back to `@deepseek-ai/<name>`; published-scope copies
+ * keep `@prettier-ai/<name>`.
  *
  * Usage:
  *   node --experimental-strip-types scripts/bundle-cli.ts --workspace <dir> --out dist/npm-cli
