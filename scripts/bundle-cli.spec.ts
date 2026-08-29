@@ -126,7 +126,14 @@ function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, stri
   )
   writeFileSync(
     join(packageDir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),
-    'window.__ModuleLoader__.load({ id: "@prettier-ai/dsh-client-modules" })\n',
+    [
+      'window.__ModuleLoader__.load({ id: "@prettier-ai/dsh-client-modules" })',
+      '\t\t\tconstructor(options) {',
+      '\t\t\t\tthis.manifest = options.manifest;',
+      '\t\t\t\tthis.seed = new Map(Object.entries(options.staticModules));',
+      '\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;',
+      '',
+    ].join('\n'),
   )
   mkdirSync(join(packageDir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets'), { recursive: true })
   writeFileSync(
@@ -519,7 +526,9 @@ describe('packBundledDirectory', () => {
       { encoding: 'utf8' },
     )
     expect(modulesClient).toContain('@deepseek-ai/dsh-client-modules')
-    expect(modulesClient).not.toContain('@prettier-ai/')
+    expect(modulesClient).not.toContain('@prettier-ai/dsh-client-modules')
+    expect(modulesClient).toContain('this.seed.set(alt, val)')
+    expect(modulesClient).toContain('"@prettier" + "-ai/"')
     const frontendAsset = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'],

@@ -36,10 +36,13 @@
  * 2. Browser/plugin identity restore: rescope rewrites CLIENT_MODULES_ID,
  *    tsdown client-bundle banners, Vite seed keys, and `dsh.client.inject` to
  *    `@prettier-ai/*`. Third-party plugins still name `@deepseek-ai/*`. After
- *    pack, those wire IDs are restored so HTML parser-preloads match. npm
- *    package names and bundle YAML Loader `name` fields stay `@prettier-ai/*`
- *    (typert requires Loader name === package.json `name`). The client-modules
- *    scan then emits `@deepseek-ai/*` graph row ids from those Loader names.
+ *    pack, those wire IDs are restored so HTML parser-preloads match. The
+ *    client-modules seed Map also aliases each platform key onto the other
+ *    scope, so `require("@deepseek-ai/dsh-client-ui-primitives")` hits a table
+ *    that Vite still keyed `@prettier-ai/*`. npm package names and bundle YAML
+ *    Loader `name` fields stay `@prettier-ai/*` (typert requires Loader name
+ *    === package.json `name`). The client-modules scan then emits
+ *    `@deepseek-ai/*` graph row ids from those Loader names.
  * 3. Profile fallback links: the fat CLI strips `@prettier-ai/*` from
  *    `dependencies`, so official `healProfilesModuleFallback` only links the
  *    CLI package itself. The wrapper also symlinks every bundled
@@ -149,6 +152,9 @@ export function restoreOfficialPluginIdentities(packageDir: string): readonly st
     }
     const clientJs = join(packageRoot, 'lib/client.js')
     if (restorePublishedScopeInFile(clientJs)) changed.push(`${rel}/lib/client.js`)
+    if (rewriteClientModuleSeedAliases(clientJs) && !changed.includes(`${rel}/lib/client.js`)) {
+      changed.push(`${rel}/lib/client.js`)
+    }
     if (isWireIdentityPackage(name, packageRoot)) {
       const libDir = join(packageRoot, 'lib')
       if (existsSync(libDir)) {
@@ -899,8 +905,15 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
     const body = packedMemberText(tarball, modulesClient)
     if (body === undefined) {
       failures.push(`${filename}: failed to read ${modulesClient}`)
-    } else if (body.includes(TO_SCOPE)) {
-      failures.push(`${filename}: ${modulesClient} still contains ${TO_SCOPE} plugin identities`)
+    } else {
+      if (body.includes(`${TO_SCOPE}${CLIENT_MODULES_NAME}`)) {
+        failures.push(`${filename}: ${modulesClient} still registers ${TO_SCOPE}${CLIENT_MODULES_NAME}`)
+      }
+      if (body.includes('this.seed = new Map(Object.entries(options.staticModules))') && !body.includes('this.seed.set(alt, val)')) {
+        failures.push(
+          `${filename}: ${modulesClient} must alias platform seed keys across @prettier-ai and @deepseek-ai`,
+        )
+      }
     }
   }
   const aliasManifestPath = 'package/node_modules/@deepseek-ai/dsh-client-modules/package.json'
@@ -1000,6 +1013,45 @@ const CLIENT_MODULE_PROCESS_ONE_WIRE = `\tprocessOne(entryName) {
 \t\t});
 \t\treturn true;
 \t}`
+
+/** Official compiled ClientModuleSystem constructor seed assignment (0.1.1-rc.2). */
+const CLIENT_MODULE_SEED_INIT = `\t\t\tconstructor(options) {
+\t\t\t\tthis.manifest = options.manifest;
+\t\t\t\tthis.seed = new Map(Object.entries(options.staticModules));
+\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;`
+
+/** Duplicate each platform seed under the other scope so third-party @deepseek-ai requires hit a @prettier-ai Vite table and the reverse.
+ * Scope strings are split so a later restorePublishedScopeInFile replaceAll cannot collapse both branches. */
+const CLIENT_MODULE_SEED_ALIASED = `\t\t\tconstructor(options) {
+\t\t\t\tthis.manifest = options.manifest;
+\t\t\t\tthis.seed = new Map(Object.entries(options.staticModules));
+\t\t\t\tfor (const [key, val] of [...this.seed]) {
+\t\t\t\t\tconst published = "@prettier" + "-ai/";
+\t\t\t\t\tconst official = "@deepseek" + "-ai/";
+\t\t\t\t\tif (key.startsWith(published)) {
+\t\t\t\t\t\tconst alt = official + key.slice(published.length);
+\t\t\t\t\t\tif (!this.seed.has(alt)) this.seed.set(alt, val);
+\t\t\t\t\t} else if (key.startsWith(official)) {
+\t\t\t\t\t\tconst alt = published + key.slice(official.length);
+\t\t\t\t\t\tif (!this.seed.has(alt)) this.seed.set(alt, val);
+\t\t\t\t\t}
+\t\t\t\t}
+\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;`
+
+/**
+ * Copy platform seed entries onto both published and official scopes.
+ * Vite `Jd()` may still be `@prettier-ai/*` when a pack skipped asset restore;
+ * third-party factories always `require("@deepseek-ai/dsh-client-ui-primitives")`.
+ * @param path - packed `dsh-client-modules/lib/client.js`.
+ */
+function rewriteClientModuleSeedAliases(path: string): boolean {
+  if (!existsSync(path)) return false
+  const before = readFileSync(path, 'utf8')
+  if (before.includes('this.seed.set(alt, val)')) return false
+  if (!before.includes(CLIENT_MODULE_SEED_INIT)) return false
+  writeFileSync(path, before.replace(CLIENT_MODULE_SEED_INIT, CLIENT_MODULE_SEED_ALIASED))
+  return true
+}
 
 /**
  * Key the web plugin table by official wire ids. Loader YAML stays
