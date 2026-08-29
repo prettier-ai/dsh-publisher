@@ -625,7 +625,14 @@ function writeRescopedClientModules(packageDir: string): void {
   )
   writeFileSync(
     join(published, 'lib/client.js'),
-    'window.__ModuleLoader__.load({ id: "@prettier-ai/dsh-client-modules" })\n',
+    [
+      'window.__ModuleLoader__.load({ id: "@prettier-ai/dsh-client-modules" })',
+      '\t\t\tconstructor(options) {',
+      '\t\t\t\tthis.manifest = options.manifest;',
+      '\t\t\t\tthis.seed = new Map(Object.entries(options.staticModules));',
+      '\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;',
+      '',
+    ].join('\n'),
   )
   const alias = join(packageDir, 'node_modules/@deepseek-ai/dsh-client-modules')
   mkdirSync(join(alias, 'lib'), { recursive: true })
@@ -684,7 +691,9 @@ describe('restoreOfficialPluginIdentities', () => {
       'utf8',
     )
     expect(clientJs).toContain('@deepseek-ai/dsh-client-modules')
-    expect(clientJs).not.toContain('@prettier-ai/')
+    expect(clientJs).not.toContain('@prettier-ai/dsh-client-modules')
+    expect(clientJs).toContain('this.seed.set(alt, val)')
+    expect(clientJs).toContain('"@prettier" + "-ai/"')
 
     const asset = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'),
