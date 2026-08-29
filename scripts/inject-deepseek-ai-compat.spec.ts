@@ -178,11 +178,13 @@ describe('injectPackageDir', () => {
     expect(wrapper).toMatch(/function resolveMapped\(/)
     expect(wrapper).toMatch(/function isHostSpecifier/)
     expect(wrapper).toMatch(/function resolveOfficialHost/)
+    expect(wrapper).toContain('originalParentURL')
     expect(readFileSync(join(dir, 'lib/bin.upstream.js'), 'utf8')).toContain('upstream-cli')
     const loader = readFileSync(join(dir, 'lib/deepseek-ai-compat-loader.js'), 'utf8')
     expect(loader).toContain('@deepseek-ai/')
     expect(loader).toMatch(/function isHostSpecifier/)
     expect(loader).toMatch(/function resolveOfficialHost/)
+    expect(loader).toContain('originalParentURL')
     expect(readFileSync(overlay, 'utf8')).toBe(overlayBody)
 
     const second = injectPackageDir(dir)
@@ -482,6 +484,62 @@ describe('runtime hook', () => {
       cwd: join(root, 'profile-plugin'),
     })
     expect(result.trim()).toBe('from-official-alias')
+  })
+
+  it('resolves a CLI package dependency after a failed profile lookup', () => {
+    const root = makeTemp('dsh-compat-cli-dep-')
+    const dshDir = join(root, 'prefix/node_modules/@prettier-ai/dsh')
+    writeCliFixture(dshDir, {
+      binSource: [
+        '#!/usr/bin/env node',
+        'const target = process.argv[2]',
+        'if (typeof target !== "string") throw new Error("missing module")',
+        'await import(target)',
+        '',
+      ].join('\n'),
+    })
+    writeBarePlugin(join(dshDir, 'node_modules/leftover-dep'), 'leftover-dep', 'from-cli-dep')
+    mkdirSync(join(dshDir, 'node_modules/@prettier-ai/dsh-typert-registry'), { recursive: true })
+    writeFileSync(join(dshDir, 'node_modules/@prettier-ai/dsh-typert-registry/package.json'), `${JSON.stringify({
+      name: '@prettier-ai/dsh-typert-registry',
+      type: 'module',
+      exports: { '.': './index.js' },
+    }, null, 2)}\n`)
+    writeFileSync(
+      join(dshDir, 'node_modules/@prettier-ai/dsh-typert-registry/index.js'),
+      [
+        'import { id } from "leftover-dep"',
+        'if (id !== "from-cli-dep") throw new Error(`unexpected leftover ${id}`)',
+        'export { id }',
+        '',
+      ].join('\n'),
+    )
+
+    const dshHome = join(root, 'dsh-home')
+    const profileDir = join(dshHome, 'profiles/web')
+    mkdirSync(profileDir, { recursive: true })
+    writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify({
+      name: 'web',
+      type: 'module',
+    }, null, 2)}\n`)
+    writeFileSync(join(profileDir, 'load.js'), [
+      'import { id } from "@prettier-ai/dsh-typert-registry"',
+      'if (id !== "from-cli-dep") throw new Error(`typert ${id}`)',
+      'console.log(id)',
+      '',
+    ].join('\n'))
+
+    injectPackageDir(dshDir)
+    mkdirSync(join(root, 'elsewhere'), { recursive: true })
+    const result = execFileSync(process.execPath, [
+      join(dshDir, 'lib/bin.js'),
+      pathToFileURL(join(profileDir, 'load.js')).href,
+    ], {
+      encoding: 'utf8',
+      cwd: join(root, 'elsewhere'),
+      env: { ...process.env, DSH_HOME: dshHome },
+    })
+    expect(result.trim()).toBe('from-cli-dep')
   })
 })
 

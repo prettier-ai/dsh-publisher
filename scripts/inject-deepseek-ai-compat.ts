@@ -26,7 +26,10 @@
  *    client-modules can match Loader entry names against package.json `name`),
  *    then the `@prettier-ai/*` copy. Host `@prettier-ai/*` specifiers also
  *    resolve from this installation. Third-party profile plugins stay in
- *    `$DSH_HOME/profiles/<name>/node_modules`.
+ *    `$DSH_HOME/profiles/<name>/node_modules`. After a failed profile
+ *    `nextResolve`, Node 22 `module.register` keeps `context.parentURL` on
+ *    that profile; fallbacks must pass the snapshotted importer or CLI
+ *    packages cannot see `zod` / `commander` in bundled `node_modules`.
  * 2. Browser/plugin identity restore: rescope rewrites CLIENT_MODULES_ID,
  *    tsdown client-bundle banners, Vite seed keys, and `dsh.client.inject` to
  *    `@prettier-ai/*`. Official web profiles and third-party plugins still
@@ -390,6 +393,11 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
         `${filename}: ${relPath} must resolve official @deepseek-ai/* specifiers from CLI aliases before remapping`,
       )
     }
+    if (!body.includes('originalParentURL')) {
+      failures.push(
+        `${filename}: ${relPath} must snapshot context.parentURL before a profile nextResolve`,
+      )
+    }
     const inner = innerBinRelPath(relPath)
     if (!tarballHasMember(tarball, `package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
@@ -555,6 +563,7 @@ function shouldResolveFromProfile(specifier, parentURL) {
 }
 
 function resolveOfficialHost(specifier, context, nextResolve, cliParentURL) {
+  const originalParentURL = context.parentURL
   const mapped = mapSpecifier(specifier)
   const fromCli = (id) => nextResolve(id, { ...context, parentURL: cliParentURL })
   // Must stay synchronous: Node 24 registerHooks runs from resolveSync.
@@ -566,7 +575,7 @@ function resolveOfficialHost(specifier, context, nextResolve, cliParentURL) {
       try {
         return fromCli(mapped)
       } catch {
-        return nextResolve(specifier, context)
+        return nextResolve(specifier, { ...context, parentURL: originalParentURL })
       }
     }
   }
@@ -574,18 +583,21 @@ function resolveOfficialHost(specifier, context, nextResolve, cliParentURL) {
     try {
       return fromCli(specifier)
     } catch {
-      return nextResolve(specifier, context)
+      return nextResolve(specifier, { ...context, parentURL: originalParentURL })
     }
   }
   return undefined
 }
 
 function resolveMapped(specifier, context, nextResolve, cliParentURL) {
+  const originalParentURL = context.parentURL
   const host = resolveOfficialHost(specifier, context, nextResolve, cliParentURL)
   if (host !== undefined) return host
   // Official: profile node_modules first, then the rest. Do not remap
   // dshmarket, @dsh-ssh/*, @aaravarr/*, or dsh-subagent-sidebar.
-  if (shouldResolveFromProfile(specifier, context.parentURL)) {
+  // Snapshot parentURL: Node 22 module.register mutates context.parentURL
+  // after a failed nextResolve with a different parent.
+  if (shouldResolveFromProfile(specifier, originalParentURL)) {
     for (const parentURL of profileParentURLs()) {
       try {
         return nextResolve(specifier, { ...context, parentURL })
@@ -594,7 +606,7 @@ function resolveMapped(specifier, context, nextResolve, cliParentURL) {
       }
     }
   }
-  return nextResolve(specifier, context)
+  return nextResolve(specifier, { ...context, parentURL: originalParentURL })
 }
 
 async function registerCompat() {
@@ -715,10 +727,11 @@ function shouldResolveFromProfile(specifier, parentURL) {
 }
 
 async function resolveOfficialHost(specifier, context, nextResolve) {
+  const originalParentURL = context.parentURL
   const mapped = typeof specifier === 'string' && specifier.startsWith(FROM)
     ? TO + specifier.slice(FROM.length)
     : undefined
-  const parent = cliParentURL || context.parentURL
+  const parent = cliParentURL || originalParentURL
   const fromCli = (id) => nextResolve(id, { ...context, parentURL: parent })
   if (mapped !== undefined) {
     try {
@@ -727,7 +740,7 @@ async function resolveOfficialHost(specifier, context, nextResolve) {
       try {
         return await fromCli(mapped)
       } catch {
-        return nextResolve(specifier, context)
+        return nextResolve(specifier, { ...context, parentURL: originalParentURL })
       }
     }
   }
@@ -735,16 +748,17 @@ async function resolveOfficialHost(specifier, context, nextResolve) {
     try {
       return await fromCli(specifier)
     } catch {
-      return nextResolve(specifier, context)
+      return nextResolve(specifier, { ...context, parentURL: originalParentURL })
     }
   }
   return undefined
 }
 
 export async function resolve(specifier, context, nextResolve) {
+  const originalParentURL = context.parentURL
   const host = await resolveOfficialHost(specifier, context, nextResolve)
   if (host !== undefined) return host
-  if (shouldResolveFromProfile(specifier, context.parentURL)) {
+  if (shouldResolveFromProfile(specifier, originalParentURL)) {
     for (const parentURL of profileParentURLs()) {
       try {
         return await nextResolve(specifier, { ...context, parentURL })
@@ -753,7 +767,7 @@ export async function resolve(specifier, context, nextResolve) {
       }
     }
   }
-  return nextResolve(specifier, context)
+  return nextResolve(specifier, { ...context, parentURL: originalParentURL })
 }
 `
 }
