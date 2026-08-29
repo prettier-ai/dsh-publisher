@@ -3,3 +3,5 @@ dist/
 coverage/
 upstream/
 *.tgz
+.cursor/rules/
+decisions.tsv
