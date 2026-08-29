@@ -31,8 +31,13 @@
  *    that profile; fallbacks must pass the snapshotted importer or CLI
  *    packages cannot see `zod` / `commander` in bundled `node_modules`.
  *    `registerHooks` / `module.register` do not intercept CJS
- *    `createRequire(profile).resolve`, which `dsh-client-modules` uses to
- *    scan `dsh.client` packages.
+ *    `createRequire`. npm-installed profile plugins resolve through healed
+ *    `$DSH_HOME/profiles/node_modules`. A local plugin (`file:`, `npm link`)
+ *    realpaths outside that tree, so CJS `require('@deepseek-ai/…')` never
+ *    sees the aliases. Wrap `Module._resolveFilename` so host specifiers from
+ *    outside the CLI still resolve from this installation (official name first,
+ *    then `@prettier-ai/*`). `dsh-client-modules` also uses
+ *    `createRequire(profile).resolve` to scan `dsh.client` packages.
  * 2. Browser/plugin identity restore: rescope rewrites CLIENT_MODULES_ID,
  *    tsdown client-bundle banners, Vite seed keys, and `dsh.client.inject` to
  *    `@prettier-ai/*`. Third-party plugins still name `@deepseek-ai/*`. After
@@ -427,6 +432,11 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
         `${filename}: ${relPath} must symlink host packages into $DSH_HOME/profiles/node_modules`,
       )
     }
+    if (!body.includes('function installCjsHostResolve')) {
+      failures.push(
+        `${filename}: ${relPath} must resolve CJS @deepseek-ai/* host specifiers from the CLI for local plugins`,
+      )
+    }
     const inner = innerBinRelPath(relPath)
     if (!tarballHasMember(tarball, `package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
@@ -504,6 +514,7 @@ function wrapperSource(innerSpecifier: string): string {
   return `#!/usr/bin/env node
 /* ${COMPAT_MARKER} */
 import * as nodeModule from 'node:module'
+import { createRequire } from 'node:module'
 import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, symlinkSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative } from 'node:path'
@@ -612,6 +623,36 @@ function healHostPackageFallback(cliRoot) {
   }
 }
 
+function installCjsHostResolve(cliRoot) {
+  const Module = createRequire(import.meta.url)('module')
+  const original = Module._resolveFilename
+  const cliFilename = join(cliRoot, 'package.json')
+  const cliParent = {
+    id: cliFilename,
+    filename: cliFilename,
+    paths: Module._nodeModulePaths(cliRoot),
+  }
+  Module._resolveFilename = function (request, parent, isMain, options) {
+    const importer = parent === undefined || parent === null ? undefined : parent.filename
+    const fromOutside = typeof importer !== 'string' || importer === '' || !pathIsInside(cliRoot, importer)
+    if (fromOutside && typeof request === 'string' && (isOfficialHostSpecifier(request) || isHostSpecifier(request))) {
+      try {
+        return original.call(this, request, cliParent, isMain, options)
+      } catch {
+        const mapped = mapSpecifier(request)
+        if (mapped !== undefined) {
+          try {
+            return original.call(this, mapped, cliParent, isMain, options)
+          } catch {
+            // fall through to the real importer
+          }
+        }
+      }
+    }
+    return original.call(this, request, parent, isMain, options)
+  }
+}
+
 function isBarePackageSpecifier(specifier) {
   if (typeof specifier !== 'string' || specifier === '') return false
   if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('file:') || specifier.startsWith('node:')) return false
@@ -684,6 +725,7 @@ function resolveMapped(specifier, context, nextResolve, cliParentURL) {
 async function registerCompat() {
   const cliRoot = findInstallRoot(import.meta.url)
   healHostPackageFallback(cliRoot)
+  installCjsHostResolve(cliRoot)
   const cliParentURL = pathToFileURL(join(cliRoot, 'package.json')).href
   if (typeof nodeModule.registerHooks === 'function') {
     nodeModule.registerHooks({

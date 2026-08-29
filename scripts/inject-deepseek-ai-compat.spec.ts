@@ -178,6 +178,7 @@ describe('injectPackageDir', () => {
     expect(wrapper).toMatch(/function resolveMapped\(/)
     expect(wrapper).toMatch(/function isHostSpecifier/)
     expect(wrapper).toMatch(/function healHostPackageFallback/)
+    expect(wrapper).toMatch(/function installCjsHostResolve/)
     expect(wrapper).toMatch(/function resolveOfficialHost/)
     expect(wrapper).toContain('originalParentURL')
     expect(readFileSync(join(dir, 'lib/bin.upstream.js'), 'utf8')).toContain('upstream-cli')
@@ -584,6 +585,62 @@ describe('runtime hook', () => {
     const resolved = result.trim()
     expect(resolved).toBe(join(dshDir, 'node_modules/@prettier-ai/dsh-client-modules/package.json'))
     expect(lstatSync(join(dshHome, 'profiles/node_modules/@prettier-ai/dsh-client-modules')).isSymbolicLink()).toBe(true)
+  })
+
+  it('resolves CJS @deepseek-ai/* from a local plugin outside the profile tree', () => {
+    const root = makeTemp('dsh-compat-local-plugin-')
+    const dshDir = join(root, 'prefix/node_modules/@prettier-ai/dsh')
+    writeCliFixture(dshDir, {
+      dependencies: {},
+      binSource: [
+        '#!/usr/bin/env node',
+        'import { createRequire } from "node:module"',
+        'import { join } from "node:path"',
+        'const plugin = process.env.LOCAL_PLUGIN',
+        'if (plugin === undefined || plugin === "") throw new Error("LOCAL_PLUGIN")',
+        'const req = createRequire(join(plugin, "package.json"))',
+        'console.log(req.resolve("@deepseek-ai/cordis/package.json"))',
+        '',
+      ].join('\n'),
+    })
+    const prettierCordis = join(dshDir, 'node_modules/@prettier-ai/cordis')
+    mkdirSync(prettierCordis, { recursive: true })
+    writeFileSync(join(prettierCordis, 'package.json'), `${JSON.stringify({
+      name: '@prettier-ai/cordis',
+      type: 'module',
+      exports: { '.': './index.js', './package.json': './package.json' },
+    }, null, 2)}\n`)
+    writeFileSync(join(prettierCordis, 'index.js'), 'export const id = "from-cli-cordis"\n')
+    const aliasCordis = join(dshDir, 'node_modules/@deepseek-ai/cordis')
+    mkdirSync(aliasCordis, { recursive: true })
+    writeFileSync(join(aliasCordis, 'package.json'), `${JSON.stringify({
+      name: '@deepseek-ai/cordis',
+      type: 'module',
+      exports: { '.': './index.js', './package.json': './package.json' },
+    }, null, 2)}\n`)
+    writeFileSync(join(aliasCordis, 'index.js'), 'export const id = "from-alias-cordis"\n')
+
+    const dshHome = join(root, 'dsh-home')
+    mkdirSync(join(dshHome, 'profiles/web'), { recursive: true })
+    writeFileSync(join(dshHome, 'profiles/web/package.json'), `${JSON.stringify({
+      name: 'web',
+      type: 'module',
+    }, null, 2)}\n`)
+
+    const pluginDir = join(root, 'src/my-local-plugin')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'package.json'), `${JSON.stringify({
+      name: '@me/my-local-plugin',
+      type: 'commonjs',
+    }, null, 2)}\n`)
+
+    injectPackageDir(dshDir)
+    const result = execFileSync(process.execPath, [join(dshDir, 'lib/bin.js')], {
+      encoding: 'utf8',
+      cwd: pluginDir,
+      env: { ...process.env, DSH_HOME: dshHome, LOCAL_PLUGIN: pluginDir },
+    })
+    expect(result.trim()).toBe(join(aliasCordis, 'package.json'))
   })
 })
 
