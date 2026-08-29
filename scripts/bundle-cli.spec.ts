@@ -570,6 +570,37 @@ describe('packBundledDirectory', () => {
     expect(() => checkAppliedCompat(out)).not.toThrow()
   })
 
+  it('packs a pnpm-hoisted schemastery symlink as a real directory', () => {
+    const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-hoist-'))
+    writeDeployFixture(packageDir)
+    const store = join(
+      packageDir,
+      'node_modules/.pnpm/@prettier-ai+schemastery@3.18.1/node_modules/@prettier-ai/schemastery',
+    )
+    mkdirSync(store, { recursive: true })
+    writeFileSync(
+      join(store, 'package.json'),
+      `${JSON.stringify({ name: '@prettier-ai/schemastery', version: '3.18.1' }, null, 2)}\n`,
+    )
+    writeFileSync(join(store, 'index.js'), 'export default {}\n')
+    symlinkSync(
+      '../.pnpm/@prettier-ai+schemastery@3.18.1/node_modules/@prettier-ai/schemastery',
+      join(packageDir, 'node_modules/@prettier-ai/schemastery'),
+    )
+    expect(lstatSync(join(packageDir, 'node_modules/@prettier-ai/schemastery')).isSymbolicLink()).toBe(true)
+    const out = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-hoist-out-'))
+    const packed = packBundledDirectory(packageDir, out)
+    expect(tarballHasSymlinks(packed.file)).toBe(false)
+    expect(tarballHasHardLinks(packed.file)).toBe(false)
+    expect(tarballHasPathPrefix(packed.file, 'package/node_modules/@prettier-ai/schemastery/package.json')).toBe(true)
+    const manifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/schemastery/package.json'], {
+        encoding: 'utf8',
+      }),
+    ) as { name: string }
+    expect(manifest.name).toBe('@prettier-ai/schemastery')
+  })
+
   it('keeps the official packed identity when no version override is set', () => {
     const packageDir = mkdtempSync(join(tmpdir(), 'dsh-bundle-cli-official-'))
     writeDeployFixture(packageDir)
