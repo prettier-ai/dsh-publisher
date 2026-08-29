@@ -9,6 +9,7 @@ import {
   cliPublishConflictMessage,
   decideCliTarballPublish,
   findCliTarball,
+  npmPublishDistTag,
   publishPackedCli,
   readRegistryIntegrity,
   registryMissingAfterPublishMessage,
@@ -43,6 +44,14 @@ function fetchPresent(integrity: string): typeof fetch {
       headers: { 'Content-Type': 'application/json' },
     })
 }
+
+describe('npmPublishDistTag', () => {
+  it('publishes prereleases to next so they do not steal latest', () => {
+    expect(npmPublishDistTag('0.1.1-rc.2-bundle.7')).toBe('next')
+    expect(npmPublishDistTag('0.1.2-alpha.1')).toBe('next')
+    expect(npmPublishDistTag('0.1.1')).toBe('latest')
+  })
+})
 
 describe('decideCliTarballPublish', () => {
   const local = 'sha512-local'
@@ -165,6 +174,8 @@ describe('Pack CLI / Publish CLI workflow', () => {
     expect(yaml).toContain('bundle-cli.ts --workspace . --out dist/npm-cli')
     expect(yaml).toContain('inject-deepseek-ai-compat.ts --check --applied --from dist/npm-cli')
     expect(yaml).toContain('publish-cli-tarball.ts --from dist/npm-cli')
+    expect(yaml).toContain('npm dist-tag add "@prettier-ai/dsh@${PUBLISHED_VERSION}" latest')
+    expect(yaml).toContain('promote_latest:')
   })
 
   it('captures CLI publish failure with || so bash $? is not zero after if !', () => {

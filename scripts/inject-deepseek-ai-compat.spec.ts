@@ -631,6 +631,27 @@ function writeRescopedClientModules(packageDir: string): void {
       '\t\t\t\tthis.manifest = options.manifest;',
       '\t\t\t\tthis.seed = new Map(Object.entries(options.staticModules));',
       '\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;',
+      '\t\t\tmakeRequire(edges) {',
+      '\t\t\t\treturn (spec) => {',
+      '\t\t\t\t\tedges.add(spec);',
+      '\t\t\t\t\tif (this.seed.has(spec)) return this.seed.get(spec);',
+      '\t\t\t\t\tconst id = stripClientSuffix(spec);',
+      '\t\t\t\t\tconst record = this.loadCache.get(id);',
+      '\t\t\t\t\tif (record !== void 0) return record.exports;',
+      '\t\t\t\t\tif (this.factories.has(id)) return this.materialize(id).exports;',
+      '\t\t\t\t\tthrow new Error(`client-modules: require("${spec}") missed the module table — not a platform seed word, not a materialized module, and no registered package factory (a build-time externals drift, or a dynamic dependency that did not arrive)`);',
+      '\t\t\t\t};',
+      '\t\t\t}',
+      '\t\t\tasync import(specifier) {',
+      '\t\t\t\tif (this.seed.has(specifier)) return this.seed.get(specifier);',
+      '\t\t\t\tconst id = stripClientSuffix(specifier);',
+      '\t\t\t\tconst existing = this.loadCache.get(id);',
+      '\t\t\t\tif (existing !== void 0) return existing.exports;',
+      '\t\t\t\tconst row = this.graphRows.get(id);',
+      '\t\t\t\tif (row !== void 0) await this.arriveGraphRow(row);',
+      '\t\t\t\telse if (!this.factories.has(id)) throw new Error(`client-modules: cannot resolve "${specifier}" — not a seed word, not a materialized module, and not a row in the boot graph (the runtime mirror of the bundle purity gate)`);',
+      '\t\t\t\treturn this.materialize(id).exports;',
+      '\t\t\t}',
       '',
     ].join('\n'),
   )
@@ -694,6 +715,7 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(clientJs).not.toContain('@prettier-ai/dsh-client-modules')
     expect(clientJs).toContain('this.seed.set(alt, val)')
     expect(clientJs).toContain('"@prettier" + "-ai/"')
+    expect(clientJs).toContain('altSpec')
 
     const asset = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'),
@@ -703,6 +725,45 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(asset).not.toContain('@prettier-ai/')
 
     expect(restoreOfficialPluginIdentities(dir)).toEqual([])
+  })
+
+  it('rewrites 0.1.2 reconcilePackage graph ids onto @deepseek-ai', () => {
+    const dir = makeTemp('dsh-compat-reconcile-')
+    writeCliFixture(dir)
+    writeRescopedClientModules(dir)
+    const indexPath = join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/index.js')
+    writeFileSync(indexPath, [
+      readFileSync(indexPath, 'utf8'),
+      '\treconcilePackage(packageName) {',
+      '\t\tconst sources = [];',
+      '\t\tfor (const source of this.sources.values()) if (source.packageName === packageName) sources.push(source);',
+      '\t\tif (sources.length > 1) {',
+      '\t\t\tconst locations = sources.map((source) => `${JSON.stringify(source.loaderName)} from ${source.baseUrl}`).join(", ");',
+      '\t\t\tthrow new Error(`client-modules: package ${packageName} resolves from multiple active Loader sources: ${locations}; remove one entry`);',
+      '\t\t}',
+      '\t\tconst source = sources[0];',
+      '\t\tif (source === void 0) return this.table.delete(packageName);',
+      '\t\tif (this.table.get(packageName)?.sourceKey === source.sourceKey) return false;',
+      '\t\tconst snapshot = this.initialBundleSnapshot(packageName, source.meta.clientPath);',
+      '\t\tconst rev = this.allocateInitialRevision();',
+      '\t\tthis.table.set(packageName, {',
+      '\t\t\tentry: graphRow(packageName, rev, source.meta),',
+      '\t\t\tloaderName: source.loaderName,',
+      '\t\t\tsourceKey: source.sourceKey,',
+      '\t\t\tmeta: source.meta,',
+      '\t\t\tbundle: snapshot.bundle,',
+      '\t\t\tbaseline: snapshot.baseline,',
+      '\t\t\t...snapshot.sourceMap === void 0 ? {} : { sourceMap: snapshot.sourceMap }',
+      '\t\t});',
+      '\t\treturn true;',
+      '\t}',
+      '',
+    ].join('\n'))
+    restoreOfficialPluginIdentities(dir)
+    const indexJs = readFileSync(indexPath, 'utf8')
+    expect(indexJs).toContain('graphRow(wireId, rev, source.meta)')
+    expect(indexJs).toContain('this.table.set(wireId, {')
+    expect(indexJs).not.toContain('graphRow(packageName, rev, source.meta)')
   })
 
   it('does not rewrite the CLI package.json when only wire ids change', () => {

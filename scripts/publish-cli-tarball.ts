@@ -170,6 +170,16 @@ export async function assertRegistryHasVersion(
 }
 
 /**
+ * Which `npm publish --tag` a version uses. Any hyphen is a prerelease and
+ * publishes to `next` so a thin family tarball cannot steal `latest`.
+ * Pack CLI can still `npm dist-tag add … latest` after publish.
+ * @param version - exact version.
+ */
+export function npmPublishDistTag(version: string): 'latest' | 'next' {
+  return version.includes('-') ? 'next' : 'latest'
+}
+
+/**
  * Publish one tarball with streamed stdio. Status is the only success signal.
  * @param tarball - path to the `.tgz`.
  * @param version - exact version (prereleases use `--tag next`).
@@ -180,7 +190,7 @@ export function publishNpmTarball(
   version: string,
   extraArgs: readonly string[] = [],
 ): void {
-  const tagArgs = version.includes('-') ? ['--tag', 'next'] : []
+  const tagArgs = npmPublishDistTag(version) === 'next' ? ['--tag', 'next'] : []
   const result = spawnSync('npm', ['publish', tarball, ...extraArgs, ...tagArgs], { stdio: 'inherit' })
   if (result.error !== undefined) {
     throw new Error(`npm publish ${tarball} failed: ${result.error.message}`)
