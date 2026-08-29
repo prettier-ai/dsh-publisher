@@ -128,6 +128,16 @@ function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, stri
       '\tcompose() {',
       '\t\tconst entries = orderByModuleGraph([...this.table.values()].map((record) => record.entry));',
       '\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
+      '\t\tconst batches = [];',
+      '\t\treturn {',
+      '\t\t\trev: shortHash(JSON.stringify({',
+      '\t\t\t\tentries,',
+      '\t\t\t\tbatches',
+      '\t\t\t})),',
+      '\t\t\tentries,',
+      '\t\t\tbatches',
+      '\t\t};',
+      '\t}',
       '',
     ].join('\n'),
   )
@@ -569,6 +579,8 @@ describe('packBundledDirectory', () => {
     expect(modulesIndex).toContain('graphRow(wireId, rev, meta)')
     expect(modulesIndex).toContain('ensureLegacyClientRuntimeRow')
     expect(modulesIndex).toContain('[CLIENT_MODULES_ID, "@deepseek-ai/dsh-client-runtime"]')
+    expect(modulesIndex).toContain('sourceKey !== "legacy-client-runtime"')
+    expect(modulesIndex).toContain('entries: wireEntries')
     const modulesClient = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'],

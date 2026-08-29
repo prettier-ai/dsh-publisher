@@ -53,9 +53,12 @@
  *    Third-party 0.1.1 plugins still `require("@deepseek-ai/dsh-client-runtime/client")`.
  *    The packed CLI vendors that 0.1.1-rc.2 factory (not as a cordis Loader
  *    plugin), puts it on `PARSER_PRELOAD_IDS`, and `compose()` inserts a
- *    synthetic table row. `makeRequire` also looks up platform seeds after
- *    stripping `/client`. `reconcilePackage` must not delete that row when no
- *    Loader source owns the package.
+ *    synthetic table row so the bootstrap combo can register the factory.
+ *    Web boot `loader.create`s every returned `entries` id, so that row is
+ *    omitted from the wire graph (0.1.1 `apply()` would collide with the
+ *    0.1.2 session/workspace controllers). `makeRequire` also looks up
+ *    platform seeds after stripping `/client`. `reconcilePackage` must not
+ *    delete that row when no Loader source owns the package.
  * 3. Profile fallback links: the fat CLI strips `@prettier-ai/*` from
  *    `dependencies`, so official `healProfilesModuleFallback` only links the
  *    CLI package itself. The wrapper also symlinks every bundled
@@ -966,6 +969,11 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
           `${filename}: ${modulesIndex} must insert a legacy dsh-client-runtime graph row before compose()`,
         )
       }
+      if (body.includes('ensureLegacyClientRuntimeRow') && !body.includes('sourceKey !== "legacy-client-runtime"')) {
+        failures.push(
+          `${filename}: ${modulesIndex} must omit the synthetic dsh-client-runtime row from compose() wire entries`,
+        )
+      }
       if (
         body.includes('reconcilePackage(packageName)')
         && body.includes('this.table.delete(wireId)')
@@ -1418,11 +1426,39 @@ const CLIENT_MODULE_COMPOSE_WITH_RUNTIME = [
 	'\t\tconst bootstrap = PARSER_PRELOAD_IDS.map((id) => this.table.get(id)).filter((record) => record !== void 0);',
 ].join('\n')
 
+const CLIENT_MODULE_COMPOSE_RETURN = [
+	'\t\treturn {',
+	'\t\t\trev: shortHash(JSON.stringify({',
+	'\t\t\t\tentries,',
+	'\t\t\t\tbatches',
+	'\t\t\t})),',
+	'\t\t\tentries,',
+	'\t\t\tbatches',
+	'\t\t};',
+].join('\n')
+
+const CLIENT_MODULE_COMPOSE_WIRE_RETURN = [
+	'\t\tconst wireEntries = entries.filter((entry) => {',
+	'\t\t\tif (entry.id !== "@deepseek-ai/dsh-client-runtime") return true;',
+	'\t\t\treturn this.table.get(entry.id)?.sourceKey !== "legacy-client-runtime";',
+	'\t\t});',
+	'\t\treturn {',
+	'\t\t\trev: shortHash(JSON.stringify({',
+	'\t\t\t\tentries: wireEntries,',
+	'\t\t\t\tbatches',
+	'\t\t\t})),',
+	'\t\t\tentries: wireEntries,',
+	'\t\t\tbatches',
+	'\t\t};',
+].join('\n')
+
 /**
  * Preload the vendored 0.1.1-rc.2 `dsh-client-runtime` factory on 0.1.2 hosts.
  * Official 0.1.2 `compose()` only emits PARSER_PRELOAD rows that already exist
  * in the table; a Loader-less vendor copy never becomes a source, so compose
- * must insert the row itself.
+ * must insert the row itself. Web boot then `loader.create`s every returned
+ * entry, so the synthetic row stays in the table / bootstrap combo and is
+ * omitted from wire `entries`.
  * @param body - packed `dsh-client-modules/lib/index.js`.
  */
 function applyLegacyClientRuntimeBootstrap(body: string): string {
@@ -1438,6 +1474,12 @@ function applyLegacyClientRuntimeBootstrap(body: string): string {
   }
   if (!next.includes('ensureLegacyClientRuntimeRow') && next.includes(CLIENT_MODULE_COMPOSE_HEAD)) {
     next = next.replace(CLIENT_MODULE_COMPOSE_HEAD, CLIENT_MODULE_COMPOSE_WITH_RUNTIME)
+  }
+  if (
+    next.includes(CLIENT_MODULE_COMPOSE_RETURN)
+    && !next.includes('sourceKey !== "legacy-client-runtime"')
+  ) {
+    next = next.replace(CLIENT_MODULE_COMPOSE_RETURN, CLIENT_MODULE_COMPOSE_WIRE_RETURN)
   }
   return next
 }
