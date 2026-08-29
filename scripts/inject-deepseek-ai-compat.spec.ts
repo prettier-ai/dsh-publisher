@@ -16,6 +16,8 @@ import {
   mapDeepseekAiSpecifier,
   mergeDeepseekAiAliases,
   npmAliasFor,
+  officialPluginIdentity,
+  restoreOfficialPluginIdentities,
 } from './inject-deepseek-ai-compat.ts'
 
 function makeTemp(prefix: string): string {
@@ -56,6 +58,20 @@ function writeCliFixture(packageDir: string, options?: {
   )
   chmodSync(join(packageDir, 'lib/bin.js'), 0o755)
 }
+
+describe('officialPluginIdentity', () => {
+  it('maps published-scope names back to official plugin ids', () => {
+    expect(officialPluginIdentity('@prettier-ai/dsh-client-modules')).toBe('@deepseek-ai/dsh-client-modules')
+    expect(officialPluginIdentity('@prettier-ai/dsh-client-runtime')).toBe('@deepseek-ai/dsh-client-runtime')
+    expect(officialPluginIdentity('@prettier-ai/cordis/src/index.js')).toBe('@deepseek-ai/cordis/src/index.js')
+  })
+
+  it('leaves official and third-party ids unchanged', () => {
+    expect(officialPluginIdentity('@deepseek-ai/dsh-client-modules')).toBe('@deepseek-ai/dsh-client-modules')
+    expect(officialPluginIdentity('dshmarket')).toBe('dshmarket')
+    expect(officialPluginIdentity('@dsh-ssh/dsh-ssh')).toBe('@dsh-ssh/dsh-ssh')
+  })
+})
 
 describe('mapDeepseekAiSpecifier', () => {
   it('maps a scope-only package name and subpath', () => {
@@ -161,10 +177,12 @@ describe('injectPackageDir', () => {
     expect(wrapper).not.toMatch(/async function resolveMapped/)
     expect(wrapper).toMatch(/function resolveMapped\(/)
     expect(wrapper).toMatch(/function isHostSpecifier/)
+    expect(wrapper).toMatch(/function resolveOfficialHost/)
     expect(readFileSync(join(dir, 'lib/bin.upstream.js'), 'utf8')).toContain('upstream-cli')
     const loader = readFileSync(join(dir, 'lib/deepseek-ai-compat-loader.js'), 'utf8')
     expect(loader).toContain('@deepseek-ai/')
     expect(loader).toMatch(/function isHostSpecifier/)
+    expect(loader).toMatch(/function resolveOfficialHost/)
     expect(readFileSync(overlay, 'utf8')).toBe(overlayBody)
 
     const second = injectPackageDir(dir)
@@ -429,5 +447,147 @@ describe('runtime hook', () => {
       'from-profile-subagent-max',
       'from-profile-sidebar',
     ])
+  })
+
+  it('resolves @deepseek-ai/* from the CLI alias directory before remapping', () => {
+    const root = makeTemp('dsh-compat-alias-first-')
+    const host = join(root, 'host')
+    writeCliFixture(host, {
+      binSource: [
+        '#!/usr/bin/env node',
+        'const plugin = process.argv[2]',
+        'if (typeof plugin !== "string") throw new Error("missing plugin")',
+        'await import(plugin)',
+        '',
+      ].join('\n'),
+    })
+    writeBarePlugin(join(host, 'node_modules/@prettier-ai/cordis'), '@prettier-ai/cordis', 'from-prettier-ai')
+    writeBarePlugin(join(host, 'node_modules/@deepseek-ai/cordis'), '@prettier-ai/cordis', 'from-official-alias')
+    const plugin = join(root, 'profile-plugin/index.js')
+    mkdirSync(dirname(plugin), { recursive: true })
+    writeFileSync(plugin, [
+      'import { id } from "@deepseek-ai/cordis"',
+      'if (id !== "from-official-alias") throw new Error(`unexpected id ${id}`)',
+      'console.log(id)',
+      '',
+    ].join('\n'))
+
+    injectPackageDir(host)
+    const alias = JSON.parse(
+      readFileSync(join(host, 'node_modules/@deepseek-ai/cordis/package.json'), 'utf8'),
+    ) as { name: string }
+    expect(alias.name).toBe('@deepseek-ai/cordis')
+    const result = execFileSync(process.execPath, [join(host, 'lib/bin.js'), pathToFileURL(plugin).href], {
+      encoding: 'utf8',
+      cwd: join(root, 'profile-plugin'),
+    })
+    expect(result.trim()).toBe('from-official-alias')
+  })
+})
+
+
+function writeRescopedClientModules(packageDir: string): void {
+  const published = join(packageDir, 'node_modules/@prettier-ai/dsh-client-modules')
+  mkdirSync(join(published, 'lib'), { recursive: true })
+  writeFileSync(join(published, 'package.json'), `${JSON.stringify({
+    name: '@prettier-ai/dsh-client-modules',
+    type: 'module',
+    dsh: { client: { inject: ['@prettier-ai/dsh-client-runtime'] } },
+  }, null, 2)}\n`)
+  writeFileSync(
+    join(published, 'lib/index.js'),
+    [
+      'export const CLIENT_MODULES_ID = "@prettier-ai/dsh-client-modules"',
+      'export const CLIENT_RUNTIME_ID = "@prettier-ai/dsh-client-runtime"',
+      'export const OTHER = "@prettier-ai/cordis"',
+      '',
+    ].join('\n'),
+  )
+  writeFileSync(
+    join(published, 'lib/client.js'),
+    'window.__ModuleLoader__.load({ id: "@prettier-ai/dsh-client-modules" })\n',
+  )
+  const alias = join(packageDir, 'node_modules/@deepseek-ai/dsh-client-modules')
+  mkdirSync(join(alias, 'lib'), { recursive: true })
+  writeFileSync(join(alias, 'package.json'), `${JSON.stringify({
+    name: '@prettier-ai/dsh-client-modules',
+    type: 'module',
+    dsh: { client: { inject: ['@prettier-ai/dsh-client-runtime'] } },
+  }, null, 2)}\n`)
+  writeFileSync(join(alias, 'lib/index.js'), readFileSync(join(published, 'lib/index.js')))
+  writeFileSync(join(alias, 'lib/client.js'), readFileSync(join(published, 'lib/client.js')))
+  const frontend = join(packageDir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets')
+  mkdirSync(frontend, { recursive: true })
+  writeFileSync(
+    join(packageDir, 'node_modules/@prettier-ai/dsh-web-frontend/package.json'),
+    `${JSON.stringify({ name: '@prettier-ai/dsh-web-frontend' }, null, 2)}\n`,
+  )
+  writeFileSync(
+    join(frontend, 'index.js'),
+    'const PLATFORM_MODULES = { "@prettier-ai/dsh-client-modules": true }\n',
+  )
+}
+
+describe('restoreOfficialPluginIdentities', () => {
+  it('restores browser wire ids without renaming published-scope packages', () => {
+    const dir = makeTemp('dsh-compat-restore-')
+    writeCliFixture(dir)
+    writeRescopedClientModules(dir)
+    const paths = restoreOfficialPluginIdentities(dir)
+    expect(paths.some(path => path.endsWith('dsh-client-modules/lib/index.js'))).toBe(true)
+    expect(paths.some(path => path.endsWith('dsh-client-modules/lib/client.js'))).toBe(true)
+
+    const published = JSON.parse(
+      readFileSync(join(dir, 'node_modules/@prettier-ai/dsh-client-modules/package.json'), 'utf8'),
+    ) as { name: string; dsh: { client: { inject: string[] } } }
+    expect(published.name).toBe('@prettier-ai/dsh-client-modules')
+    expect(published.dsh.client.inject).toEqual(['@deepseek-ai/dsh-client-runtime'])
+
+    const alias = JSON.parse(
+      readFileSync(join(dir, 'node_modules/@deepseek-ai/dsh-client-modules/package.json'), 'utf8'),
+    ) as { name: string }
+    expect(alias.name).toBe('@deepseek-ai/dsh-client-modules')
+
+    const indexJs = readFileSync(
+      join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/index.js'),
+      'utf8',
+    )
+    expect(indexJs).toContain('@deepseek-ai/dsh-client-modules')
+    expect(indexJs).toContain('@deepseek-ai/dsh-client-runtime')
+    expect(indexJs).not.toContain('@prettier-ai/dsh-client-modules')
+    expect(indexJs).toContain('@prettier-ai/cordis')
+
+    const clientJs = readFileSync(
+      join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),
+      'utf8',
+    )
+    expect(clientJs).toContain('@deepseek-ai/dsh-client-modules')
+    expect(clientJs).not.toContain('@prettier-ai/')
+
+    const asset = readFileSync(
+      join(dir, 'node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'),
+      'utf8',
+    )
+    expect(asset).toContain('@deepseek-ai/dsh-client-modules')
+    expect(asset).not.toContain('@prettier-ai/')
+
+    expect(restoreOfficialPluginIdentities(dir)).toEqual([])
+  })
+
+  it('does not rewrite the CLI package.json when only wire ids change', () => {
+    const dir = makeTemp('dsh-compat-restore-manifest-')
+    writeCliFixture(dir)
+    const first = injectPackageDir(dir)
+    expect(first.changed).toBe(true)
+    const before = readFileSync(join(dir, 'package.json'))
+    writeRescopedClientModules(dir)
+    const second = injectPackageDir(dir)
+    expect(second.changed).toBe(true)
+    expect(second.wrappedBins).toEqual([])
+    expect(readFileSync(join(dir, 'package.json'))).toEqual(before)
+    const alias = JSON.parse(
+      readFileSync(join(dir, 'node_modules/@deepseek-ai/dsh-client-modules/package.json'), 'utf8'),
+    ) as { name: string }
+    expect(alias.name).toBe('@deepseek-ai/dsh-client-modules')
   })
 })
