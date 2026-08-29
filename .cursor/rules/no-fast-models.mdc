@@ -1,0 +1,16 @@
+---
+description: Never use fast model slugs. They cost about 4x and are only about 1x faster.
+alwaysApply: true
+---
+
+# No fast models
+
+Never pass a Task `model` whose slug contains `fast`.
+
+Banned examples include `cursor-grok-4.6-high-fast`, `cursor-grok-4.5-high-fast`, `composer-2.5-fast`, `gpt-5.6-sol-high-fast`, `gpt-5.6-sol-xhigh-fast`, and `claude-opus-5-thinking-high-fast`.
+
+pstack / poteto-mode defaults that name a fast slug (`grok-4.6-fast-xhigh` and any `*-fast*`) are invalid here. Do not substitute the nearest fast sibling from the available list.
+
+If the skill default is a fast slug, or the only same-family slug on the available list is fast, omit Task `model` so the subagent inherits the parent chat model.
+
+Prefer a non-fast slug from the available list (`inherit`, `claude-fable-5-thinking-xhigh`, `gpt-5.6-sol-xhigh`, `claude-opus-5-thinking-high`, `cursor-grok-4.5-high`). Never pick `*-fast` to "match" a default.
