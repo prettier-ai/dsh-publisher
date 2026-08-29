@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -177,6 +177,7 @@ describe('injectPackageDir', () => {
     expect(wrapper).not.toMatch(/async function resolveMapped/)
     expect(wrapper).toMatch(/function resolveMapped\(/)
     expect(wrapper).toMatch(/function isHostSpecifier/)
+    expect(wrapper).toMatch(/function healHostPackageFallback/)
     expect(wrapper).toMatch(/function resolveOfficialHost/)
     expect(wrapper).toContain('originalParentURL')
     expect(readFileSync(join(dir, 'lib/bin.upstream.js'), 'utf8')).toContain('upstream-cli')
@@ -541,6 +542,49 @@ describe('runtime hook', () => {
     })
     expect(result.trim()).toBe('from-cli-dep')
   })
+
+  it('links host packages into profiles/node_modules for CJS createRequire', () => {
+    const root = makeTemp('dsh-compat-heal-')
+    const dshDir = join(root, 'prefix/node_modules/@prettier-ai/dsh')
+    writeCliFixture(dshDir, {
+      dependencies: {},
+      binSource: [
+        '#!/usr/bin/env node',
+        'import { createRequire } from "node:module"',
+        'import { join } from "node:path"',
+        'const profile = join(process.env.DSH_HOME, "profiles/web/package.json")',
+        'const req = createRequire(profile)',
+        'console.log(req.resolve("@prettier-ai/dsh-client-modules/package.json"))',
+        '',
+      ].join('\n'),
+    })
+    const modulesDir = join(dshDir, 'node_modules/@prettier-ai/dsh-client-modules')
+    mkdirSync(modulesDir, { recursive: true })
+    writeFileSync(join(modulesDir, 'package.json'), `${JSON.stringify({
+      name: '@prettier-ai/dsh-client-modules',
+      type: 'module',
+      exports: { '.': './index.js', './package.json': './package.json' },
+    }, null, 2)}\n`)
+    writeFileSync(join(modulesDir, 'index.js'), 'export const id = "from-cli-modules"\n')
+
+    const dshHome = join(root, 'dsh-home')
+    const profileDir = join(dshHome, 'profiles/web')
+    mkdirSync(profileDir, { recursive: true })
+    writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify({
+      name: 'web',
+      type: 'module',
+    }, null, 2)}\n`)
+
+    injectPackageDir(dshDir)
+    const result = execFileSync(process.execPath, [join(dshDir, 'lib/bin.js')], {
+      encoding: 'utf8',
+      cwd: root,
+      env: { ...process.env, DSH_HOME: dshHome },
+    })
+    const resolved = result.trim()
+    expect(resolved).toBe(join(dshDir, 'node_modules/@prettier-ai/dsh-client-modules/package.json'))
+    expect(lstatSync(join(dshHome, 'profiles/node_modules/@prettier-ai/dsh-client-modules')).isSymbolicLink()).toBe(true)
+  })
 })
 
 
@@ -558,6 +602,24 @@ function writeRescopedClientModules(packageDir: string): void {
       'export const CLIENT_MODULES_ID = "@prettier-ai/dsh-client-modules"',
       'export const CLIENT_RUNTIME_ID = "@prettier-ai/dsh-client-runtime"',
       'export const OTHER = "@prettier-ai/cordis"',
+      '',
+      '\tprocessOne(entryName) {',
+      '\t\tlet qualifies = false;',
+      '\t\tfor (const entry of this.ctx.loader.entries()) if (entry.options.name === entryName && entry.fiber !== void 0 && !entry.disabled) {',
+      '\t\t\tqualifies = true;',
+      '\t\t\tbreak;',
+      '\t\t}',
+      '\t\tif (!qualifies) return this.table.delete(entryName);',
+      '\t\tif (this.table.has(entryName)) return false;',
+      '\t\tconst meta = this.resolveMeta(entryName);',
+      '\t\tif (meta === null) return false;',
+      '\t\tconst rev = this.initialBundleRevision(entryName, meta.clientPath);',
+      '\t\tthis.table.set(entryName, {',
+      '\t\t\tentry: graphRow(entryName, rev, meta),',
+      '\t\t\tmeta',
+      '\t\t});',
+      '\t\treturn true;',
+      '\t}',
       '',
     ].join('\n'),
   )
@@ -614,6 +676,8 @@ describe('restoreOfficialPluginIdentities', () => {
     expect(indexJs).toContain('@deepseek-ai/dsh-client-runtime')
     expect(indexJs).not.toContain('@prettier-ai/dsh-client-modules')
     expect(indexJs).toContain('@prettier-ai/cordis')
+    expect(indexJs).toContain('graphRow(wireId, rev, meta)')
+    expect(indexJs).toContain('entryName.startsWith("@prettier-ai/")')
 
     const clientJs = readFileSync(
       join(dir, 'node_modules/@prettier-ai/dsh-client-modules/lib/client.js'),

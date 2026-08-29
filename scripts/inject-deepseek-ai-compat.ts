@@ -19,7 +19,7 @@
  *   overlay must not vendor Harness sources. Wrapping the packed bin is the
  *   site we control.
  *
- * Three layers:
+ * Four layers:
  * 1. Runtime (required): a Node module hook registered from the CLI bin so
  *    `import '@deepseek-ai/cordis'` resolves from this installation. Official
  *    `@deepseek-ai/*` specifiers try the physical CLI aliases first (so
@@ -30,15 +30,25 @@
  *    `nextResolve`, Node 22 `module.register` keeps `context.parentURL` on
  *    that profile; fallbacks must pass the snapshotted importer or CLI
  *    packages cannot see `zod` / `commander` in bundled `node_modules`.
+ *    `registerHooks` / `module.register` do not intercept CJS
+ *    `createRequire(profile).resolve`, which `dsh-client-modules` uses to
+ *    scan `dsh.client` packages.
  * 2. Browser/plugin identity restore: rescope rewrites CLIENT_MODULES_ID,
  *    tsdown client-bundle banners, Vite seed keys, and `dsh.client.inject` to
- *    `@prettier-ai/*`. Official web profiles and third-party plugins still
- *    name `@deepseek-ai/*`. After pack, those wire IDs are restored so HTML
- *    parser-preloads match. npm package names stay `@prettier-ai/*`.
- * 3. Install-time: npm aliases `@deepseek-ai/<name>` →
+ *    `@prettier-ai/*`. Third-party plugins still name `@deepseek-ai/*`. After
+ *    pack, those wire IDs are restored so HTML parser-preloads match. npm
+ *    package names and bundle YAML Loader `name` fields stay `@prettier-ai/*`
+ *    (typert requires Loader name === package.json `name`). The client-modules
+ *    scan then emits `@deepseek-ai/*` graph row ids from those Loader names.
+ * 3. Profile fallback links: the fat CLI strips `@prettier-ai/*` from
+ *    `dependencies`, so official `healProfilesModuleFallback` only links the
+ *    CLI package itself. The wrapper also symlinks every bundled
+ *    `@prettier-ai/*` and `@deepseek-ai/*` into `$DSH_HOME/profiles/node_modules`
+ *    so CJS resolve from the profile can see host plugins.
+ * 4. Install-time: npm aliases `@deepseek-ai/<name>` →
  *    `npm:@prettier-ai/<name>@<same range>` on each `@prettier-ai/*`
- *    dependency, so `healProfilesModuleFallback` and `resolve.paths` still
- *    find physical `@deepseek-ai/*` directories for existing profile manifests.
+ *    dependency when the thin graph still lists them. The fat tarball does
+ *    not re-list those names.
  *
  * The published CLI bin name stays `dsh`. This overlay wraps the file at
  * `lib/bin.js`; it does not rename `bin.dsh` in package.json.
@@ -108,13 +118,13 @@ const WIRE_IDENTITY_FROM = [
 
 /**
  * Restore official `@deepseek-ai/*` plugin identities inside packed CLI
- * `node_modules` so HTML parser-preloads match official profile Loader names.
+ * `node_modules` so HTML parser-preloads match third-party `inject` lists.
  *
  * Live failure: the inlined `__ModuleLoader__.create()` looks up
- * `@prettier-ai/dsh-client-modules` while `__DSH_BOOT__.entries` and
- * third-party `inject` still use `@deepseek-ai/*`. Host plugins then drop
- * out of the boot graph (0.1.2 `nearestPackage` requires `name` === loader
- * id), so the HTML never parser-preloads `client.js`.
+ * `CLIENT_MODULES_ID` while host Loader YAML (after rescope) still names
+ * `@prettier-ai/*`. Restoring YAML names breaks typert (manifest.package must
+ * equal package.json `name`). Keep Loader names published-scope and rewrite
+ * the client-modules graph row id onto `@deepseek-ai/*`.
  * @param packageDir - unpacked CLI package directory.
  * @returns Relative paths that changed.
  */
@@ -144,7 +154,10 @@ export function restoreOfficialPluginIdentities(packageDir: string): readonly st
       if (existsSync(libDir)) {
         for (const file of readdirSync(libDir)) {
           if (!file.endsWith('.js') || file === 'client.js') continue
-          if (restoreWireIdsInFile(join(libDir, file))) changed.push(`${rel}/lib/${file}`)
+          const libFile = join(libDir, file)
+          let fileChanged = restoreWireIdsInFile(libFile)
+          if (file === 'index.js' && rewriteClientModuleGraphIds(libFile)) fileChanged = true
+          if (fileChanged) changed.push(`${rel}/lib/${file}`)
         }
       }
     }
@@ -398,6 +411,11 @@ function checkPackedApp(tarball: string, filename: string, manifest: PackedManif
         `${filename}: ${relPath} must snapshot context.parentURL before a profile nextResolve`,
       )
     }
+    if (!body.includes('function healHostPackageFallback')) {
+      failures.push(
+        `${filename}: ${relPath} must symlink host packages into $DSH_HOME/profiles/node_modules`,
+      )
+    }
     const inner = innerBinRelPath(relPath)
     if (!tarballHasMember(tarball, `package/${inner.replaceAll('\\', '/')}`)) {
       failures.push(`${filename}: missing wrapped upstream bin package/${inner}`)
@@ -475,7 +493,7 @@ function wrapperSource(innerSpecifier: string): string {
   return `#!/usr/bin/env node
 /* ${COMPAT_MARKER} */
 import * as nodeModule from 'node:module'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, symlinkSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -537,6 +555,49 @@ function findInstallRoot(fromUrl) {
       throw new Error('dsh: cannot find package.json above the CLI bin for @deepseek-ai/* compatibility')
     }
     dir = parent
+  }
+}
+
+function ensureManagedSymlink(link, target) {
+  let stat
+  try {
+    stat = lstatSync(link)
+  } catch {
+    stat = undefined
+  }
+  if (stat !== undefined) {
+    if (!stat.isSymbolicLink()) {
+      throw new Error('dsh: ' + link + ' exists and is not a symlink; remove it so dsh can manage the installation fallback')
+    }
+    if (readlinkSync(link) === target) return
+    unlinkSync(link)
+  }
+  mkdirSync(dirname(link), { recursive: true })
+  try {
+    symlinkSync(target, link, 'junction')
+  } catch (error) {
+    if (error.code !== 'EEXIST' || !lstatSync(link).isSymbolicLink() || readlinkSync(link) !== target) throw error
+  }
+}
+
+function healHostPackageFallback(cliRoot) {
+  const modulesDir = join(resolveDshHome(), 'profiles', 'node_modules')
+  mkdirSync(modulesDir, { recursive: true })
+  for (const scope of [TO.slice(0, -1), FROM.slice(0, -1)]) {
+    const scopeDir = join(cliRoot, 'node_modules', scope)
+    if (!existsSync(scopeDir)) continue
+    let entries
+    try {
+      entries = readdirSync(scopeDir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue
+      const target = join(scopeDir, entry.name)
+      if (!existsSync(join(target, 'package.json'))) continue
+      ensureManagedSymlink(join(modulesDir, scope, entry.name), target)
+    }
   }
 }
 
@@ -610,7 +671,9 @@ function resolveMapped(specifier, context, nextResolve, cliParentURL) {
 }
 
 async function registerCompat() {
-  const cliParentURL = pathToFileURL(join(findInstallRoot(import.meta.url), 'package.json')).href
+  const cliRoot = findInstallRoot(import.meta.url)
+  healHostPackageFallback(cliRoot)
+  const cliParentURL = pathToFileURL(join(cliRoot, 'package.json')).href
   if (typeof nodeModule.registerHooks === 'function') {
     nodeModule.registerHooks({
       resolve(specifier, context, nextResolve) {
@@ -824,6 +887,11 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
       if (!body.includes(`${FROM_SCOPE}${CLIENT_MODULES_NAME}`)) {
         failures.push(`${filename}: ${modulesIndex} is missing ${FROM_SCOPE}${CLIENT_MODULES_NAME}`)
       }
+      if (body.includes('processOne(entryName)') && !body.includes('graphRow(wireId, rev, meta)')) {
+        failures.push(
+          `${filename}: ${modulesIndex} must emit official @deepseek-ai graph ids from published-scope Loader names`,
+        )
+      }
     }
   }
   const modulesClient = 'package/node_modules/@prettier-ai/dsh-client-modules/lib/client.js'
@@ -892,6 +960,60 @@ function restoreWireIdsInFile(path: string): boolean {
   }
   if (changed) writeFileSync(path, body)
   return changed
+}
+
+/** Official compiled `ClientModuleRegistry.processOne` (tabs, 0.1.1-rc.2). */
+const CLIENT_MODULE_PROCESS_ONE = `\tprocessOne(entryName) {
+\t\tlet qualifies = false;
+\t\tfor (const entry of this.ctx.loader.entries()) if (entry.options.name === entryName && entry.fiber !== void 0 && !entry.disabled) {
+\t\t\tqualifies = true;
+\t\t\tbreak;
+\t\t}
+\t\tif (!qualifies) return this.table.delete(entryName);
+\t\tif (this.table.has(entryName)) return false;
+\t\tconst meta = this.resolveMeta(entryName);
+\t\tif (meta === null) return false;
+\t\tconst rev = this.initialBundleRevision(entryName, meta.clientPath);
+\t\tthis.table.set(entryName, {
+\t\t\tentry: graphRow(entryName, rev, meta),
+\t\t\tmeta
+\t\t});
+\t\treturn true;
+\t}`
+
+/** Graph ids must be `@deepseek-ai/*` so HTML preloads and third-party inject match. */
+const CLIENT_MODULE_PROCESS_ONE_WIRE = `\tprocessOne(entryName) {
+\t\tconst wireId = entryName.startsWith("@prettier-ai/") ? "@deepseek-ai/" + entryName.slice("@prettier-ai/".length) : entryName;
+\t\tlet qualifies = false;
+\t\tfor (const entry of this.ctx.loader.entries()) if (entry.options.name === entryName && entry.fiber !== void 0 && !entry.disabled) {
+\t\t\tqualifies = true;
+\t\t\tbreak;
+\t\t}
+\t\tif (!qualifies) return this.table.delete(wireId);
+\t\tif (this.table.has(wireId)) return false;
+\t\tconst meta = this.resolveMeta(entryName) ?? this.resolveMeta(wireId);
+\t\tif (meta === null) return false;
+\t\tconst rev = this.initialBundleRevision(entryName, meta.clientPath);
+\t\tthis.table.set(wireId, {
+\t\t\tentry: graphRow(wireId, rev, meta),
+\t\t\tmeta
+\t\t});
+\t\treturn true;
+\t}`
+
+/**
+ * Key the web plugin table by official wire ids. Loader YAML stays
+ * `@prettier-ai/*` (typert / package.json `name`); `createRequire(profile)`
+ * still resolves the published-scope package.
+ * @param path - packed `dsh-client-modules/lib/index.js`.
+ */
+function rewriteClientModuleGraphIds(path: string): boolean {
+  if (!existsSync(path)) return false
+  const before = readFileSync(path, 'utf8')
+  if (before.includes('graphRow(wireId, rev, meta)')) return false
+  if (!before.includes(CLIENT_MODULE_PROCESS_ONE)) return false
+  writeFileSync(path, before.replace(CLIENT_MODULE_PROCESS_ONE, CLIENT_MODULE_PROCESS_ONE_WIRE))
+  return true
 }
 
 function collectScopedPackageDirs(nodeModulesDir: string): string[] {
