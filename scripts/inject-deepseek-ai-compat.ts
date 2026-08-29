@@ -38,11 +38,13 @@
  *    `@prettier-ai/*`. Third-party plugins still name `@deepseek-ai/*`. After
  *    pack, those wire IDs are restored so HTML parser-preloads match. The
  *    client-modules seed Map also aliases each platform key onto the other
- *    scope, so `require("@deepseek-ai/dsh-client-ui-primitives")` hits a table
- *    that Vite still keyed `@prettier-ai/*`. npm package names and bundle YAML
- *    Loader `name` fields stay `@prettier-ai/*` (typert requires Loader name
- *    === package.json `name`). The client-modules scan then emits
- *    `@deepseek-ai/*` graph row ids from those Loader names.
+ *    scope, and `makeRequire` / `import` retry the other scope, so
+ *    `require("@deepseek-ai/dsh-client-ui-primitives")` hits a table that Vite
+ *    still keyed `@prettier-ai/*`. npm package names and bundle YAML Loader
+ *    `name` fields stay `@prettier-ai/*` (typert requires Loader name ===
+ *    package.json `name`). The client-modules scan then emits `@deepseek-ai/*`
+ *    graph row ids from those Loader names (0.1.1-rc.2 `processOne`, 0.1.2
+ *    `reconcilePackage`).
  * 3. Profile fallback links: the fat CLI strips `@prettier-ai/*` from
  *    `dependencies`, so official `healProfilesModuleFallback` only links the
  *    CLI package itself. The wrapper also symlinks every bundled
@@ -153,6 +155,9 @@ export function restoreOfficialPluginIdentities(packageDir: string): readonly st
     const clientJs = join(packageRoot, 'lib/client.js')
     if (restorePublishedScopeInFile(clientJs)) changed.push(`${rel}/lib/client.js`)
     if (rewriteClientModuleSeedAliases(clientJs) && !changed.includes(`${rel}/lib/client.js`)) {
+      changed.push(`${rel}/lib/client.js`)
+    }
+    if (rewriteClientModuleRequireAliases(clientJs) && !changed.includes(`${rel}/lib/client.js`)) {
       changed.push(`${rel}/lib/client.js`)
     }
     if (isWireIdentityPackage(name, packageRoot)) {
@@ -893,9 +898,14 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
       if (!body.includes(`${FROM_SCOPE}${CLIENT_MODULES_NAME}`)) {
         failures.push(`${filename}: ${modulesIndex} is missing ${FROM_SCOPE}${CLIENT_MODULES_NAME}`)
       }
-      if (body.includes('processOne(entryName)') && !body.includes('graphRow(wireId, rev, meta)')) {
+      if (body.includes(CLIENT_MODULE_PROCESS_ONE) && !body.includes('graphRow(wireId, rev, meta)')) {
         failures.push(
           `${filename}: ${modulesIndex} must emit official @deepseek-ai graph ids from published-scope Loader names`,
+        )
+      }
+      if (body.includes(CLIENT_MODULE_RECONCILE_PACKAGE) && !body.includes('graphRow(wireId, rev, source.meta)')) {
+        failures.push(
+          `${filename}: ${modulesIndex} must emit official @deepseek-ai graph ids from 0.1.2 reconcilePackage`,
         )
       }
     }
@@ -912,6 +922,11 @@ function checkRestoredPluginIdentities(tarball: string, filename: string): strin
       if (body.includes('this.seed = new Map(Object.entries(options.staticModules))') && !body.includes('this.seed.set(alt, val)')) {
         failures.push(
           `${filename}: ${modulesClient} must alias platform seed keys across @prettier-ai and @deepseek-ai`,
+        )
+      }
+      if (body.includes('makeRequire(edges)') && !body.includes('altSpec')) {
+        failures.push(
+          `${filename}: ${modulesClient} must look up the other scope in makeRequire/import`,
         )
       }
     }
@@ -1014,6 +1029,122 @@ const CLIENT_MODULE_PROCESS_ONE_WIRE = `\tprocessOne(entryName) {
 \t\treturn true;
 \t}`
 
+/** Official compiled 0.1.2-alpha.1 `reconcilePackage` (tabs). */
+const CLIENT_MODULE_RECONCILE_PACKAGE = [
+	'\treconcilePackage(packageName) {',
+	'\t\tconst sources = [];',
+	'\t\tfor (const source of this.sources.values()) if (source.packageName === packageName) sources.push(source);',
+	'\t\tif (sources.length > 1) {',
+	'\t\t\tconst locations = sources.map((source) => `${JSON.stringify(source.loaderName)} from ${source.baseUrl}`).join(", ");',
+	'\t\t\tthrow new Error(`client-modules: package ${packageName} resolves from multiple active Loader sources: ${locations}; remove one entry`);',
+	'\t\t}',
+	'\t\tconst source = sources[0];',
+	'\t\tif (source === void 0) return this.table.delete(packageName);',
+	'\t\tif (this.table.get(packageName)?.sourceKey === source.sourceKey) return false;',
+	'\t\tconst snapshot = this.initialBundleSnapshot(packageName, source.meta.clientPath);',
+	'\t\tconst rev = this.allocateInitialRevision();',
+	'\t\tthis.table.set(packageName, {',
+	'\t\t\tentry: graphRow(packageName, rev, source.meta),',
+	'\t\t\tloaderName: source.loaderName,',
+	'\t\t\tsourceKey: source.sourceKey,',
+	'\t\t\tmeta: source.meta,',
+	'\t\t\tbundle: snapshot.bundle,',
+	'\t\t\tbaseline: snapshot.baseline,',
+	'\t\t\t...snapshot.sourceMap === void 0 ? {} : { sourceMap: snapshot.sourceMap }',
+	'\t\t});',
+	'\t\treturn true;',
+	'\t}',
+].join('\n')
+
+/** Graph ids must be `@deepseek-ai/*`; disk snapshot still uses the published-scope package name. */
+const CLIENT_MODULE_RECONCILE_PACKAGE_WIRE = [
+	'\treconcilePackage(packageName) {',
+	'\t\tconst wireId = packageName.startsWith("@prettier-ai/") ? "@deepseek-ai/" + packageName.slice("@prettier-ai/".length) : packageName;',
+	'\t\tconst sources = [];',
+	'\t\tfor (const source of this.sources.values()) if (source.packageName === packageName) sources.push(source);',
+	'\t\tif (sources.length > 1) {',
+	'\t\t\tconst locations = sources.map((source) => `${JSON.stringify(source.loaderName)} from ${source.baseUrl}`).join(", ");',
+	'\t\t\tthrow new Error(`client-modules: package ${packageName} resolves from multiple active Loader sources: ${locations}; remove one entry`);',
+	'\t\t}',
+	'\t\tconst source = sources[0];',
+	'\t\tif (source === void 0) return this.table.delete(wireId);',
+	'\t\tif (this.table.get(wireId)?.sourceKey === source.sourceKey) return false;',
+	'\t\tconst snapshot = this.initialBundleSnapshot(packageName, source.meta.clientPath);',
+	'\t\tconst rev = this.allocateInitialRevision();',
+	'\t\tthis.table.set(wireId, {',
+	'\t\t\tentry: graphRow(wireId, rev, source.meta),',
+	'\t\t\tloaderName: source.loaderName,',
+	'\t\t\tsourceKey: source.sourceKey,',
+	'\t\t\tmeta: source.meta,',
+	'\t\t\tbundle: snapshot.bundle,',
+	'\t\t\tbaseline: snapshot.baseline,',
+	'\t\t\t...snapshot.sourceMap === void 0 ? {} : { sourceMap: snapshot.sourceMap }',
+	'\t\t});',
+	'\t\treturn true;',
+	'\t}',
+].join('\n')
+
+/** Official compiled `makeRequire` + `import` (tabs, 0.1.1-rc.2 and 0.1.2-alpha.1). */
+const CLIENT_MODULE_MAKE_REQUIRE = [
+	'\t\t\tmakeRequire(edges) {',
+	'\t\t\t\treturn (spec) => {',
+	'\t\t\t\t\tedges.add(spec);',
+	'\t\t\t\t\tif (this.seed.has(spec)) return this.seed.get(spec);',
+	'\t\t\t\t\tconst id = stripClientSuffix(spec);',
+	'\t\t\t\t\tconst record = this.loadCache.get(id);',
+	'\t\t\t\t\tif (record !== void 0) return record.exports;',
+	'\t\t\t\t\tif (this.factories.has(id)) return this.materialize(id).exports;',
+	'\t\t\t\t\tthrow new Error(`client-modules: require("${spec}") missed the module table — not a platform seed word, not a materialized module, and no registered package factory (a build-time externals drift, or a dynamic dependency that did not arrive)`);',
+	'\t\t\t\t};',
+	'\t\t\t}',
+	'\t\t\tasync import(specifier) {',
+	'\t\t\t\tif (this.seed.has(specifier)) return this.seed.get(specifier);',
+	'\t\t\t\tconst id = stripClientSuffix(specifier);',
+	'\t\t\t\tconst existing = this.loadCache.get(id);',
+	'\t\t\t\tif (existing !== void 0) return existing.exports;',
+	'\t\t\t\tconst row = this.graphRows.get(id);',
+	'\t\t\t\tif (row !== void 0) await this.arriveGraphRow(row);',
+	'\t\t\t\telse if (!this.factories.has(id)) throw new Error(`client-modules: cannot resolve "${specifier}" — not a seed word, not a materialized module, and not a row in the boot graph (the runtime mirror of the bundle purity gate)`);',
+	'\t\t\t\treturn this.materialize(id).exports;',
+	'\t\t\t}',
+].join('\n')
+
+/** Retry the other scope so a third-party @deepseek-ai require hits a @prettier-ai seed/factory. */
+const CLIENT_MODULE_MAKE_REQUIRE_ALIASED = [
+	'\t\t\tmakeRequire(edges) {',
+	'\t\t\t\treturn (spec) => {',
+	'\t\t\t\t\tedges.add(spec);',
+	'\t\t\t\t\tconst published = "@prettier" + "-ai/";',
+	'\t\t\t\t\tconst official = "@deepseek" + "-ai/";',
+	'\t\t\t\t\tconst altSpec = spec.startsWith(published) ? official + spec.slice(published.length) : spec.startsWith(official) ? published + spec.slice(official.length) : spec;',
+	'\t\t\t\t\tif (this.seed.has(spec)) return this.seed.get(spec);',
+	'\t\t\t\t\tif (altSpec !== spec && this.seed.has(altSpec)) return this.seed.get(altSpec);',
+	'\t\t\t\t\tconst id = stripClientSuffix(spec);',
+	'\t\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\t\tconst record = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
+	'\t\t\t\t\tif (record !== void 0) return record.exports;',
+	'\t\t\t\t\tif (this.factories.has(id)) return this.materialize(id).exports;',
+	'\t\t\t\t\tif (altId !== id && this.factories.has(altId)) return this.materialize(altId).exports;',
+	'\t\t\t\t\tthrow new Error(`client-modules: require("${spec}") missed the module table — not a platform seed word, not a materialized module, and no registered package factory (a build-time externals drift, or a dynamic dependency that did not arrive)`);',
+	'\t\t\t\t};',
+	'\t\t\t}',
+	'\t\t\tasync import(specifier) {',
+	'\t\t\t\tconst published = "@prettier" + "-ai/";',
+	'\t\t\t\tconst official = "@deepseek" + "-ai/";',
+	'\t\t\t\tconst altSpec = specifier.startsWith(published) ? official + specifier.slice(published.length) : specifier.startsWith(official) ? published + specifier.slice(official.length) : specifier;',
+	'\t\t\t\tif (this.seed.has(specifier)) return this.seed.get(specifier);',
+	'\t\t\t\tif (altSpec !== specifier && this.seed.has(altSpec)) return this.seed.get(altSpec);',
+	'\t\t\t\tconst id = stripClientSuffix(specifier);',
+	'\t\t\t\tconst altId = stripClientSuffix(altSpec);',
+	'\t\t\t\tconst existing = this.loadCache.get(id) ?? (altId !== id ? this.loadCache.get(altId) : void 0);',
+	'\t\t\t\tif (existing !== void 0) return existing.exports;',
+	'\t\t\t\tconst row = this.graphRows.get(id) ?? (altId !== id ? this.graphRows.get(altId) : void 0);',
+	'\t\t\t\tif (row !== void 0) await this.arriveGraphRow(row);',
+	'\t\t\t\telse if (!this.factories.has(id) && (altId === id || !this.factories.has(altId))) throw new Error(`client-modules: cannot resolve "${specifier}" — not a seed word, not a materialized module, and not a row in the boot graph (the runtime mirror of the bundle purity gate)`);',
+	'\t\t\t\treturn this.materialize(this.factories.has(id) || this.graphRows.has(id) ? id : altId).exports;',
+	'\t\t\t}',
+].join('\n')
+
 /** Official compiled ClientModuleSystem constructor seed assignment (0.1.1-rc.2). */
 const CLIENT_MODULE_SEED_INIT = `\t\t\tconstructor(options) {
 \t\t\t\tthis.manifest = options.manifest;
@@ -1054,6 +1185,21 @@ function rewriteClientModuleSeedAliases(path: string): boolean {
 }
 
 /**
+ * Look up seed/factory/graph rows under the other scope.
+ * Constructor seed copies are not enough when factories are keyed by one
+ * identity and a third-party plugin requires the other.
+ * @param path - packed `dsh-client-modules/lib/client.js`.
+ */
+function rewriteClientModuleRequireAliases(path: string): boolean {
+  if (!existsSync(path)) return false
+  const before = readFileSync(path, 'utf8')
+  if (before.includes('altSpec')) return false
+  if (!before.includes(CLIENT_MODULE_MAKE_REQUIRE)) return false
+  writeFileSync(path, before.replace(CLIENT_MODULE_MAKE_REQUIRE, CLIENT_MODULE_MAKE_REQUIRE_ALIASED))
+  return true
+}
+
+/**
  * Key the web plugin table by official wire ids. Loader YAML stays
  * `@prettier-ai/*` (typert / package.json `name`); `createRequire(profile)`
  * still resolves the published-scope package.
@@ -1062,9 +1208,15 @@ function rewriteClientModuleSeedAliases(path: string): boolean {
 function rewriteClientModuleGraphIds(path: string): boolean {
   if (!existsSync(path)) return false
   const before = readFileSync(path, 'utf8')
-  if (before.includes('graphRow(wireId, rev, meta)')) return false
-  if (!before.includes(CLIENT_MODULE_PROCESS_ONE)) return false
-  writeFileSync(path, before.replace(CLIENT_MODULE_PROCESS_ONE, CLIENT_MODULE_PROCESS_ONE_WIRE))
+  let body = before
+  if (body.includes(CLIENT_MODULE_PROCESS_ONE)) {
+    body = body.replace(CLIENT_MODULE_PROCESS_ONE, CLIENT_MODULE_PROCESS_ONE_WIRE)
+  }
+  if (body.includes(CLIENT_MODULE_RECONCILE_PACKAGE)) {
+    body = body.replace(CLIENT_MODULE_RECONCILE_PACKAGE, CLIENT_MODULE_RECONCILE_PACKAGE_WIRE)
+  }
+  if (body === before) return false
+  writeFileSync(path, body)
   return true
 }
 

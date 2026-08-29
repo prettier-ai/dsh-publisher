@@ -132,6 +132,27 @@ function writeDeployFixture(packageDir: string, cordisDeps?: Record<string, stri
       '\t\t\t\tthis.manifest = options.manifest;',
       '\t\t\t\tthis.seed = new Map(Object.entries(options.staticModules));',
       '\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;',
+      '\t\t\tmakeRequire(edges) {',
+      '\t\t\t\treturn (spec) => {',
+      '\t\t\t\t\tedges.add(spec);',
+      '\t\t\t\t\tif (this.seed.has(spec)) return this.seed.get(spec);',
+      '\t\t\t\t\tconst id = stripClientSuffix(spec);',
+      '\t\t\t\t\tconst record = this.loadCache.get(id);',
+      '\t\t\t\t\tif (record !== void 0) return record.exports;',
+      '\t\t\t\t\tif (this.factories.has(id)) return this.materialize(id).exports;',
+      '\t\t\t\t\tthrow new Error(`client-modules: require("${spec}") missed the module table — not a platform seed word, not a materialized module, and no registered package factory (a build-time externals drift, or a dynamic dependency that did not arrive)`);',
+      '\t\t\t\t};',
+      '\t\t\t}',
+      '\t\t\tasync import(specifier) {',
+      '\t\t\t\tif (this.seed.has(specifier)) return this.seed.get(specifier);',
+      '\t\t\t\tconst id = stripClientSuffix(specifier);',
+      '\t\t\t\tconst existing = this.loadCache.get(id);',
+      '\t\t\t\tif (existing !== void 0) return existing.exports;',
+      '\t\t\t\tconst row = this.graphRows.get(id);',
+      '\t\t\t\tif (row !== void 0) await this.arriveGraphRow(row);',
+      '\t\t\t\telse if (!this.factories.has(id)) throw new Error(`client-modules: cannot resolve "${specifier}" — not a seed word, not a materialized module, and not a row in the boot graph (the runtime mirror of the bundle purity gate)`);',
+      '\t\t\t\treturn this.materialize(id).exports;',
+      '\t\t\t}',
       '',
     ].join('\n'),
   )
@@ -529,6 +550,7 @@ describe('packBundledDirectory', () => {
     expect(modulesClient).not.toContain('@prettier-ai/dsh-client-modules')
     expect(modulesClient).toContain('this.seed.set(alt, val)')
     expect(modulesClient).toContain('"@prettier" + "-ai/"')
+    expect(modulesClient).toContain('altSpec')
     const frontendAsset = execFileSync(
       'tar',
       ['-xOzf', packed.file, 'package/node_modules/@prettier-ai/dsh-web-frontend/dist/assets/index.js'],
