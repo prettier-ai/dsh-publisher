@@ -226,10 +226,6 @@ jobs:
         working-directory: upstream
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # Official root postinstall imports lefthook (a devDependency).
-          # pnpm 11 `pnpm run` runs `pnpm install --production` first
-          # (runDepsStatusCheck), which strips lefthook then executes postinstall.
-          NPM_CONFIG_IGNORE_SCRIPTS: 'true'
         run: |
           set -euo pipefail
           if [[ -z "${NPM_TOKEN}" ]]; then
@@ -238,8 +234,20 @@ jobs:
             exit 0
           fi
           export NODE_AUTH_TOKEN="${NPM_TOKEN}"
-          pnpm run --config.ignore-scripts=true release:publish --family vendor --from dist/npm-vendor
-          pnpm run --config.ignore-scripts=true release:publish --family dsh --from dist/npm
+          # pnpm 11 `pnpm run` calls runDepsStatusCheck → `pnpm install --production`.
+          # That prunes tsx (release:publish) and re-runs official postinstall,
+          # which statically imports lefthook (a pruned devDependency).
+          # `--config.ignore-scripts=true` on `pnpm run` does not reach that nested
+          # install (Actions run 33324079814). Skip the check via CLI boolean, not
+          # an env string "false" (pnpm#12019 treats that as truthy). Write the
+          # same keys into .npmrc so a nested pnpm still sees them, and neutralize
+          # install-lefthook.mjs if postinstall still runs.
+          printf '%s\n' 'verify-deps-before-run=false' 'ignore-scripts=true' >> .npmrc
+          if [[ -f scripts/install-lefthook.mjs ]]; then
+            printf '%s\n' 'process.exit(0);' > scripts/install-lefthook.mjs
+          fi
+          pnpm run --config.verify-deps-before-run=false --config.ignore-scripts=true release:publish --family vendor --from dist/npm-vendor
+          pnpm run --config.verify-deps-before-run=false --config.ignore-scripts=true release:publish --family dsh --from dist/npm
           node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-dshp.ts" --from "${GITHUB_WORKSPACE}/dist/npm-dshp"
 
       # The tag marks the version as processed so scheduled runs go back to the
