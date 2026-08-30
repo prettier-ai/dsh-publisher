@@ -984,6 +984,8 @@ describe('workflows', () => {
     expect(cli.indexOf('--apply-supported-architectures')).toBeGreaterThan(-1)
     expect(cli.indexOf('--apply-supported-architectures')).toBeLessThan(cliInstall)
     expect(sync.indexOf('--apply-supported-architectures')).toBeLessThan(syncInstall)
+    expect(sync).toContain('pnpm run --config.ignore-scripts=true release:publish')
+    expect(sync).toContain('NPM_CONFIG_IGNORE_SCRIPTS')
     expect(cli).toContain('Fetch optional natives for every published OS')
     expect(cli).not.toMatch(/^\s+- cron:/m)
     expect(cli).not.toMatch(/^\s+pnpm run release:pack --family/m)
