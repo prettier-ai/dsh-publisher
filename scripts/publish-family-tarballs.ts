@@ -28,7 +28,6 @@ import { parseArgs } from 'node:util'
 import {
   npmPublishDistTag,
   readRegistryIntegrity,
-  registryMissingAfterPublishMessage,
   tarballIntegrity,
   type RegistryIntegrity,
   type TarballPublishIo,
@@ -73,7 +72,7 @@ const TRANSIENT_PUBLISH_CODES = [
 const PUBLISH_ATTEMPTS = 4
 const PUBLISH_SPACING_MS = 2_000
 /** GET after `npm publish` can 404 while npm is still processing the packument. */
-const REGISTRY_VISIBLE_ATTEMPTS = 8
+const REGISTRY_VISIBLE_ATTEMPTS = 15
 
 /**
  * Decide whether one packed tarball may be published.
@@ -172,8 +171,15 @@ export async function publishPackedFamily(
     } else {
       await publishNpmTarballWithRetry(tarball.file, tarball.version, tarball.name, fetchImpl, sleep)
     }
-    await waitForRegistryVersion(tarball.name, tarball.version, fetchImpl, sleep)
-    console.log(`publish-family: ${progress} ${tarball.name}@${tarball.version} published`)
+    const visible = await waitForRegistryVersion(tarball.name, tarball.version, fetchImpl, sleep)
+    if (!visible) {
+      console.log(
+        `publish-family: ${progress} ${tarball.name}@${tarball.version} published; `
+        + 'registry GET still 404, continuing (Actions run 33691258894)',
+      )
+    } else {
+      console.log(`publish-family: ${progress} ${tarball.name}@${tarball.version} published`)
+    }
     published += 1
   }
   console.log(
@@ -186,19 +192,17 @@ async function waitForRegistryVersion(
   version: string,
   fetchImpl: typeof fetch,
   sleep: (ms: number) => Promise<void>,
-): Promise<void> {
+): Promise<boolean> {
   for (let tries = 1; tries <= REGISTRY_VISIBLE_ATTEMPTS; tries += 1) {
     const registry = await readRegistryIntegrity(name, version, fetchImpl)
-    if (registry.kind === 'present') return
-    if (tries === REGISTRY_VISIBLE_ATTEMPTS) {
-      throw new Error(registryMissingAfterPublishMessage(name, version))
-    }
+    if (registry.kind === 'present') return true
+    if (tries === REGISTRY_VISIBLE_ATTEMPTS) return false
     if (tries === 1) {
       console.log(`publish-family: ${name}@${version} not visible yet, waiting for the registry`)
     }
     await sleep(PUBLISH_SPACING_MS)
   }
-  throw new Error(registryMissingAfterPublishMessage(name, version))
+  return false
 }
 
 function isTransientFailure(output: string): boolean {
