@@ -985,7 +985,7 @@ describe('workflows', () => {
     expect(cli.indexOf('--apply-supported-architectures')).toBeLessThan(cliInstall)
     expect(sync.indexOf('--apply-supported-architectures')).toBeLessThan(syncInstall)
     expect(sync).toContain('publish-family-tarballs.ts" --from dist/npm-vendor --on-conflict skip')
-    expect(sync).toContain('publish-family-tarballs.ts" --from dist/npm --on-conflict fail')
+    expect(sync).toContain('publish-family-tarballs.ts" --from dist/npm --on-conflict skip')
     expect(sync).not.toMatch(/^\s+pnpm run release:publish --family/m)
     expect(cli).toContain('Fetch optional natives for every published OS')
     expect(cli).not.toMatch(/^\s+- cron:/m)

@@ -234,15 +234,16 @@ jobs:
             exit 0
           fi
           export NODE_AUTH_TOKEN="${NPM_TOKEN}"
-          # Official `pnpm run release:publish` aborts the family when a
-          # name@version is already on npm with different bytes. Vendor
-          # packages reuse versions across official tags (Actions run
-          # 33638213440: cordis-plugin-hmr@1.0.17) and cannot be overwritten.
-          # Skip those tarballs; fail the same clash on the dsh family.
-          # Invoke from this repository so we never `pnpm run` (pnpm 11
-          # runDepsStatusCheck → `pnpm install --production`).
+          # Official `release:publish` aborts the family when a name@version is
+          # already on npm with different bytes. npm cannot overwrite. Vendor
+          # packages reuse versions across official tags (33638213440:
+          # cordis-plugin-hmr@1.0.17). A retried dsh family can re-pack a
+          # non-identical CLI tarball after a partial publish (33677189975:
+          # @prettier-ai/dsh@0.1.2-alpha.5). Skip clashes in both families and
+          # keep publishing absences. Invoke from this repository so we never
+          # `pnpm run` (pnpm 11 runDepsStatusCheck → `pnpm install --production`).
           node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-family-tarballs.ts" --from dist/npm-vendor --on-conflict skip
-          node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-family-tarballs.ts" --from dist/npm --on-conflict fail
+          node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-family-tarballs.ts" --from dist/npm --on-conflict skip
           node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-dshp.ts" --from "${GITHUB_WORKSPACE}/dist/npm-dshp"
 
       # The tag marks the version as processed so scheduled runs go back to the

@@ -6,16 +6,17 @@
  * across official tags; npm cannot overwrite, so Sync would never reach the
  * new dsh family (Actions run 33638213440: `@prettier-ai/cordis-plugin-hmr@1.0.17`).
  *
- * `--on-conflict skip` (vendor): skip matching and mismatched already-published
- * tarballs; publish only absences.
- * `--on-conflict fail` (dsh family): skip matching integrity; fail on mismatch.
+ * `--on-conflict skip` (Sync vendor and dsh families): skip matching and
+ * mismatched already-published tarballs; publish only absences.
+ * `--on-conflict fail`: skip matching integrity; fail on mismatch (kept for
+ * tests; Pack CLI uses the stricter CLI publisher).
  *
  * Does not call `pnpm run`, so pnpm 11 cannot `pnpm install --production`
  * before the script.
  *
  * Usage:
  *   node --experimental-strip-types scripts/publish-family-tarballs.ts --from dist/npm-vendor --on-conflict skip
- *   node --experimental-strip-types scripts/publish-family-tarballs.ts --from dist/npm --on-conflict fail
+ *   node --experimental-strip-types scripts/publish-family-tarballs.ts --from dist/npm --on-conflict skip
  */
 
 import { execFileSync, spawnSync } from 'node:child_process'
