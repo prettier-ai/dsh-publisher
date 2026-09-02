@@ -1,8 +1,11 @@
 /**
  * Decide whether an official DeepSeek Harness release still needs a
  * `@prettier-ai` publication. The sync workflow calls this before fetching
- * upstream so a repeated schedule run exits quickly when npm or this
- * repository's tracking tag already records the version.
+ * upstream so a repeated schedule run exits quickly when this repository's
+ * tracking tag and `@prettier-ai/dsh@version` both record the version.
+ * npm having the CLI package is not enough: a failed family publish can leave
+ * `@prettier-ai/dsh` on the registry without the rest of the family or the
+ * tracking tag (Actions run 33661740268).
  *
  * The scheduled decide job sparse-checkouts only this file and runs it with
  * Node 24 type stripping (`node --experimental-strip-types
@@ -160,16 +163,18 @@ export async function probeUpstreamRelease(request: ProbeRequest, deps: ProbeDep
     }
   }
   const version = await readUpstreamVersion(release.tag, deps)
-  if (await deps.npmHasVersion(ENTRY_PACKAGE, version)) {
+  const trackingTag = `prettier-ai/${version}`
+  const onNpm = await deps.npmHasVersion(ENTRY_PACKAGE, version)
+  const tracked = deps.gitHasTag(trackingTag)
+  if (tracked && onNpm) {
     return {
       action: 'skip',
       tag: release.tag,
       version,
-      reason: `${ENTRY_PACKAGE}@${version} is already on the npm registry`,
+      reason: `tracking tag ${trackingTag} exists and ${ENTRY_PACKAGE}@${version} is on the npm registry`,
     }
   }
-  const trackingTag = `prettier-ai/${version}`
-  if (deps.gitHasTag(trackingTag)) {
+  if (tracked) {
     return {
       action: 'publish-only',
       tag: release.tag,

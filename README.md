@@ -25,9 +25,9 @@ The cheap `decide` job sparse-checkouts only `scripts/probe-upstream-release.ts`
 1. Resolves the upstream tag. With no operator tag it tries `GET /repos/deepseek-ai/deepseek-harness/releases/latest`. If that 404s or there is no non-prerelease latest, it falls back to the newest non-draft GitHub Release from `GET /releases?per_page=1` (this includes prereleases). Drafts are skipped. A dispatch `--tag` still names a specific tag, including prereleases. If upstream has no releases at all, the probe skips.
 2. Reads `apps/cli/package.json` at that tag to learn the npm version (falling back to the tag suffix if the file is unavailable).
 3. Decides one of:
-   - `skip` — `@prettier-ai/dsh@<version>` already exists on the npm registry. The heavy job does not run.
-   - `publish-only` — this repository's tracking tag `prettier-ai/<version>` exists but npm lacks the version (for example a previous run packed but could not publish). The heavy job runs again end to end; publishing is idempotent per package.
-   - `sync` — the version is new. The heavy job runs and pushes the tracking tag afterwards.
+   - `skip` — tracking tag `prettier-ai/<version>` exists and `@prettier-ai/dsh@<version>` is on npm. The heavy job does not run.
+   - `publish-only` — the tracking tag exists but npm lacks the CLI version (for example a previous run packed but could not publish). The heavy job runs again end to end; publishing is idempotent per package.
+   - `sync` — the tracking tag is missing. The heavy job runs even if `@prettier-ai/dsh` is already on npm (a partial family publish) and pushes the tracking tag afterwards.
 
 The heavy `sync` job fetches the official tag (shallow clone), copies the overlay scripts onto that checkout, runs `--apply` and `--check --applied` there, installs the rescoped workspace, builds, packs the `vendor` family then the `dsh` family, replaces the thin CLI tarball with a lockfile-bundled package (`pnpm deploy` of `apps/cli` plus production `node_modules`, workspace names stripped from `dependencies`), keeps the host-side `@deepseek-ai/*` runtime loader on that bundle, uploads the tarballs as workflow artifacts, and publishes.
 

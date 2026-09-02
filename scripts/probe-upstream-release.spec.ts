@@ -120,7 +120,7 @@ describe('probeUpstreamRelease', () => {
     return Buffer.from(JSON.stringify({ name: '@deepseek-ai/dsh', version })).toString('base64')
   }
 
-  it('skips when npm already has the entry version', async () => {
+  it('syncs when npm has the CLI package but the tracking tag is missing', async () => {
     const result = await probeUpstreamRelease(
       { tag: '' },
       {
@@ -130,10 +130,27 @@ describe('probeUpstreamRelease', () => {
       },
     )
     expect(result).toEqual({
+      action: 'sync',
+      tag: 'dsh-v1.2.3',
+      version: '1.2.3',
+      reason: 'new official tag dsh-v1.2.3 (version 1.2.3)',
+    })
+  })
+
+  it('skips when the tracking tag exists and npm has the entry version', async () => {
+    const result = await probeUpstreamRelease(
+      { tag: '' },
+      {
+        fetchJson: github('dsh-v1.2.3'),
+        npmHasVersion: () => true,
+        gitHasTag: tag => tag === 'prettier-ai/1.2.3',
+      },
+    )
+    expect(result).toEqual({
       action: 'skip',
       tag: 'dsh-v1.2.3',
       version: '1.2.3',
-      reason: '@prettier-ai/dsh@1.2.3 is already on the npm registry',
+      reason: 'tracking tag prettier-ai/1.2.3 exists and @prettier-ai/dsh@1.2.3 is on the npm registry',
     })
   })
 
@@ -209,7 +226,7 @@ describe('probeUpstreamRelease', () => {
     })
   })
 
-  it('skips the newest prerelease when npm already has that version', async () => {
+  it('syncs the newest prerelease when npm has it but the tracking tag is missing', async () => {
     const result = await probeUpstreamRelease(
       { tag: '' },
       {
@@ -227,11 +244,10 @@ describe('probeUpstreamRelease', () => {
         gitHasTag: () => false,
       },
     )
-    expect(result).toEqual({
-      action: 'skip',
+    expect(result).toMatchObject({
+      action: 'sync',
       tag: 'dsh-v1.2.3-alpha.4',
       version: '1.2.3-alpha.4',
-      reason: '@prettier-ai/dsh@1.2.3-alpha.4 is already on the npm registry',
     })
   })
 
