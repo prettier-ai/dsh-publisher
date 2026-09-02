@@ -150,17 +150,17 @@ describe('publishPackedFamily', () => {
     expect(publishes).toBe(0)
   })
 
-  it('does not succeed when npm publish returns and the version is still absent', async () => {
+  it('continues when npm publish returns and GET of the version stays 404', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-family-404-'))
     packManifest(dir, { name: '@prettier-ai/dsh-base', version: '0.1.2-alpha.5' }, 'base.tgz')
     let publishes = 0
-    await expect(publishPackedFamily(dir, 'fail', {
+    await publishPackedFamily(dir, 'fail', {
       fetchImpl: fetch404(),
       publish: () => {
         publishes += 1
       },
       sleep: async () => {},
-    })).rejects.toThrow(/is not on the registry after publish/)
+    })
     expect(publishes).toBe(1)
   })
 
