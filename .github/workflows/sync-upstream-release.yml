@@ -234,20 +234,15 @@ jobs:
             exit 0
           fi
           export NODE_AUTH_TOKEN="${NPM_TOKEN}"
-          # pnpm 11 `pnpm run` calls runDepsStatusCheck → `pnpm install --production`.
-          # That prunes tsx (release:publish) and re-runs official postinstall,
-          # which statically imports lefthook (a pruned devDependency).
-          # `--config.ignore-scripts=true` on `pnpm run` does not reach that nested
-          # install (Actions run 33324079814). Skip the check via CLI boolean, not
-          # an env string "false" (pnpm#12019 treats that as truthy). Write the
-          # same keys into .npmrc so a nested pnpm still sees them, and neutralize
-          # install-lefthook.mjs if postinstall still runs.
-          printf '%s\n' 'verify-deps-before-run=false' 'ignore-scripts=true' >> .npmrc
-          if [[ -f scripts/install-lefthook.mjs ]]; then
-            printf '%s\n' 'process.exit(0);' > scripts/install-lefthook.mjs
-          fi
-          pnpm run --config.verify-deps-before-run=false --config.ignore-scripts=true release:publish --family vendor --from dist/npm-vendor
-          pnpm run --config.verify-deps-before-run=false --config.ignore-scripts=true release:publish --family dsh --from dist/npm
+          # Official `pnpm run release:publish` aborts the family when a
+          # name@version is already on npm with different bytes. Vendor
+          # packages reuse versions across official tags (Actions run
+          # 33638213440: cordis-plugin-hmr@1.0.17) and cannot be overwritten.
+          # Skip those tarballs; fail the same clash on the dsh family.
+          # Invoke from this repository so we never `pnpm run` (pnpm 11
+          # runDepsStatusCheck → `pnpm install --production`).
+          node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-family-tarballs.ts" --from dist/npm-vendor --on-conflict skip
+          node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-family-tarballs.ts" --from dist/npm --on-conflict fail
           node --experimental-strip-types "${GITHUB_WORKSPACE}/scripts/publish-dshp.ts" --from "${GITHUB_WORKSPACE}/dist/npm-dshp"
 
       # The tag marks the version as processed so scheduled runs go back to the
