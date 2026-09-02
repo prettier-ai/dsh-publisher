@@ -25,9 +25,9 @@
 1. 解析上游 tag。未指定操作者 tag 时，先请求 `GET /repos/deepseek-ai/deepseek-harness/releases/latest`。若该接口 404 或没有非预发布的 latest，则回退到 `GET /releases?per_page=1` 中最新的非草稿 GitHub Release（包含预发布）。草稿会被跳过。手动 `--tag` 仍可直接指定某个 tag（含预发布）。上游尚无任何 Release 时探测会安静跳过。
 2. 读取该 tag 下的 `apps/cli/package.json` 获取 npm 版本号（文件不可用时回退为 tag 后缀）。
 3. 得出三种决策之一：
-   - `skip` —— `@prettier-ai/dsh@<version>` 已存在于 npm registry，重活作业不运行。
-   - `publish-only` —— 本仓库的跟踪 tag `prettier-ai/<version>` 已存在但 npm 缺少该版本（例如上一次运行完成打包但未能发布）。重活作业端到端重跑；发布按包幂等。
-   - `sync` —— 全新版本。重活作业运行，结束后推送跟踪 tag。
+   - `skip` —— 跟踪 tag `prettier-ai/<version>` 已存在，且 `@prettier-ai/dsh@<version>` 已在 npm 上。重活作业不运行。
+   - `publish-only` —— 跟踪 tag 已存在但 npm 缺少该 CLI 版本（例如上一次运行完成打包但未能发布）。重活作业端到端重跑；发布按包幂等。
+   - `sync` —— 跟踪 tag 缺失。即使 `@prettier-ai/dsh` 已在 npm（全家包只发了一部分），也会跑重活，结束后推送跟踪 tag。
 
 重活的 `sync` 作业拉取官方 tag（浅克隆），把 overlay 脚本复制到该检出上，在其中运行 `--apply` 与 `--check --applied`，安装改写后的 workspace，构建，先打包 `vendor` 家族再打包 `dsh` 家族，再用 lockfile 捆绑包替换瘦 CLI tarball（对 `apps/cli` 做 `pnpm deploy` 并带上 production `node_modules`，从 `dependencies` 去掉 workspace 包名），在该捆绑包上保留宿主侧 `@deepseek-ai/*` 运行时 loader，将 tarball 上传为 workflow 产物，然后发布。
 

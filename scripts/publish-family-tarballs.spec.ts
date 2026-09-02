@@ -163,6 +163,33 @@ describe('publishPackedFamily', () => {
     })).rejects.toThrow(/is not on the registry after publish/)
     expect(publishes).toBe(1)
   })
+
+  it('waits when GET 404s after npm publish then the version document appears', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-family-delay-'))
+    const tarball = packManifest(dir, { name: '@prettier-ai/dsh-base', version: '0.1.2-alpha.5' }, 'base.tgz')
+    let fetches = 0
+    const fetchImpl: typeof fetch = async () => {
+      fetches += 1
+      if (fetches <= 3) return new Response('Not Found', { status: 404, statusText: 'Not Found' })
+      return new Response(JSON.stringify({ dist: { integrity: tarballIntegrity(tarball) } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    let publishes = 0
+    let waits = 0
+    await publishPackedFamily(dir, 'fail', {
+      fetchImpl,
+      publish: () => {
+        publishes += 1
+      },
+      sleep: async () => {
+        waits += 1
+      },
+    })
+    expect(publishes).toBe(1)
+    expect(waits).toBeGreaterThan(0)
+  })
 })
 
 describe('workflows', () => {

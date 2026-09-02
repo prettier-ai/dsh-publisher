@@ -25,9 +25,9 @@ import { setTimeout as sleepMs } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import {
-  assertRegistryHasVersion,
   npmPublishDistTag,
   readRegistryIntegrity,
+  registryMissingAfterPublishMessage,
   tarballIntegrity,
   type RegistryIntegrity,
   type TarballPublishIo,
@@ -71,6 +71,8 @@ const TRANSIENT_PUBLISH_CODES = [
 
 const PUBLISH_ATTEMPTS = 4
 const PUBLISH_SPACING_MS = 2_000
+/** GET after `npm publish` can 404 while npm is still processing the packument. */
+const REGISTRY_VISIBLE_ATTEMPTS = 8
 
 /**
  * Decide whether one packed tarball may be published.
@@ -169,13 +171,33 @@ export async function publishPackedFamily(
     } else {
       await publishNpmTarballWithRetry(tarball.file, tarball.version, tarball.name, fetchImpl, sleep)
     }
-    await assertRegistryHasVersion(tarball.name, tarball.version, fetchImpl)
+    await waitForRegistryVersion(tarball.name, tarball.version, fetchImpl, sleep)
     console.log(`publish-family: ${progress} ${tarball.name}@${tarball.version} published`)
     published += 1
   }
   console.log(
     `publish-family: ${total} member(s), ${String(published)} published, ${String(skipped)} already present`,
   )
+}
+
+async function waitForRegistryVersion(
+  name: string,
+  version: string,
+  fetchImpl: typeof fetch,
+  sleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  for (let tries = 1; tries <= REGISTRY_VISIBLE_ATTEMPTS; tries += 1) {
+    const registry = await readRegistryIntegrity(name, version, fetchImpl)
+    if (registry.kind === 'present') return
+    if (tries === REGISTRY_VISIBLE_ATTEMPTS) {
+      throw new Error(registryMissingAfterPublishMessage(name, version))
+    }
+    if (tries === 1) {
+      console.log(`publish-family: ${name}@${version} not visible yet, waiting for the registry`)
+    }
+    await sleep(PUBLISH_SPACING_MS)
+  }
+  throw new Error(registryMissingAfterPublishMessage(name, version))
 }
 
 function isTransientFailure(output: string): boolean {
