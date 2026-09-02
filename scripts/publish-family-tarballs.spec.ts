@@ -193,17 +193,18 @@ describe('publishPackedFamily', () => {
 })
 
 describe('workflows', () => {
-  it('publishes vendor with skip-on-conflict then dsh with fail-on-conflict', () => {
+  it('publishes vendor and dsh families with skip-on-conflict', () => {
     const sync = readFileSync(new URL('../.github/workflows/sync-upstream-release.yml', import.meta.url), 'utf8')
     const cli = readFileSync(new URL('../.github/workflows/publish-cli.yml', import.meta.url), 'utf8')
     expect(sync).toContain(
       'publish-family-tarballs.ts" --from dist/npm-vendor --on-conflict skip',
     )
     expect(sync).toContain(
-      'publish-family-tarballs.ts" --from dist/npm --on-conflict fail',
+      'publish-family-tarballs.ts" --from dist/npm --on-conflict skip',
     )
-    expect(sync).toMatch(/on-conflict fail[\s\S]*publish-dshp\.ts/)
+    expect(sync).toMatch(/dist\/npm --on-conflict skip[\s\S]*publish-dshp\.ts/)
     expect(sync).not.toMatch(/^\s+pnpm run release:publish --family/m)
+    expect(sync).not.toContain('--on-conflict fail')
     expect(cli).not.toContain('publish-family-tarballs.ts')
     expect(cli).not.toMatch(/^\s+pnpm run release:publish --family/m)
   })
